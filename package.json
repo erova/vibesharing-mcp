@@ -1,0 +1,56 @@
+{
+  "name": "@vibesharingapp/mcp-server",
+  "version": "0.7.2",
+  "description": "MCP server for VibeSharing - register prototypes and get feedback directly from Claude Code",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "vibesharing-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "glama.json"
+  ],
+  "scripts": {
+    "build": "tsc && chmod +x dist/index.js",
+    "dev": "tsc --watch",
+    "start": "node dist/index.js",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "claude",
+    "claude-code",
+    "vibesharing",
+    "prototypes",
+    "feedback",
+    "collaboration",
+    "ai",
+    "cursor",
+    "vibe-coding"
+  ],
+  "author": "VibeSharing <hello@vibesharing.app>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/erova/vibesharing.git",
+    "directory": "mcp-server"
+  },
+  "bugs": {
+    "url": "https://github.com/erova/vibesharing/issues"
+  },
+  "homepage": "https://vibesharing.app",
+  "mcpName": "io.github.erova/vibesharing",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
+  }
+}
