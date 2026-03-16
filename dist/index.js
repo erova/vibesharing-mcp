@@ -96,8 +96,16 @@ class VibesharingClient {
     async syncContext(projectId, content) {
         return this.request("/api/context", {
             method: "POST",
-            body: JSON.stringify({ projectId, content }),
+            body: JSON.stringify({
+                projectId,
+                content,
+                version: "auto-sync",
+                updatedByName: "MCP Deploy",
+            }),
         });
+    }
+    async listFeedbackTopics(projectId) {
+        return this.request(`/api/feedback-topics?projectId=${projectId}`);
     }
     async verifyToken() {
         const url = `${this.baseUrl}/api/prototypes`;
@@ -122,6 +130,12 @@ class VibesharingClient {
                 filename: filename || "page.tsx",
                 storage_option: storageOption || "permanent",
             }),
+        });
+    }
+    async deployStatic(params) {
+        return this.request("/api/deploy/static", {
+            method: "POST",
+            body: JSON.stringify(params),
         });
     }
     async deployPrototype(params) {
@@ -243,7 +257,7 @@ function fuzzyMatch(query, items, getName, threshold = 0.3) {
         .sort((a, b) => b.score - a.score);
 }
 // ---- Version tracking & What's New ----
-const CURRENT_VERSION = "0.7.2";
+const CURRENT_VERSION = "0.9.3";
 const WHATS_NEW = {
     "0.6.0": [
         "🆕 VibeSharing MCP v0.6.0 — What's New:",
@@ -347,6 +361,49 @@ let updateNotice = null;
     }
 })();
 const client = new VibesharingClient(VIBESHARING_URL, VIBESHARING_TOKEN);
+// Check for unread feedback (non-blocking — runs in background)
+let pendingFeedbackCheck = (async () => {
+    try {
+        const result = await client.listPrototypes();
+        const prototypes = (result.prototypes || []).slice(0, 10);
+        if (prototypes.length === 0)
+            return null;
+        const feedbackByPrototype = [];
+        await Promise.all(prototypes.map(async (proto) => {
+            try {
+                const fbResult = await client.getFeedback(proto.id, { status: "open" });
+                const feedback = (fbResult.feedback || []);
+                if (feedback.length > 0) {
+                    feedbackByPrototype.push({ name: proto.name, items: feedback });
+                }
+            }
+            catch {
+                // Skip prototypes we can't access
+            }
+        }));
+        if (feedbackByPrototype.length === 0)
+            return null;
+        let summary = "📬 Unread feedback since your last session:\n";
+        for (const proto of feedbackByPrototype) {
+            const count = proto.items.length;
+            summary += `\n"${proto.name}" — ${count} new item${count !== 1 ? "s" : ""}\n`;
+            for (const item of proto.items.slice(0, 5)) {
+                const priorityTag = item.priority ? ` (${item.priority} priority)` : "";
+                const truncated = item.content.length > 80 ? item.content.slice(0, 77) + "..." : item.content;
+                summary += `  - ${item.user_name}: "${truncated}"${priorityTag}\n`;
+            }
+            if (proto.items.length > 5) {
+                summary += `  ... and ${proto.items.length - 5} more\n`;
+            }
+        }
+        summary += "\nUse get_feedback to see full details, or triage_feedback to respond.";
+        return summary;
+    }
+    catch {
+        // Silently ignore — don't block startup for a feedback check
+        return null;
+    }
+})();
 // Create MCP server
 const server = new index_js_1.Server({
     name: "vibesharing",
@@ -363,7 +420,7 @@ server.setRequestHandler(types_js_1.ListToolsRequestSchema, async () => {
         tools: [
             {
                 name: "register_prototype",
-                description: "Register a new prototype on VibeSharing. IMPORTANT: Before calling this, use resolve_target to confirm the collection and project name with the user. Do not auto-generate names without user confirmation. Returns the VibeSharing URL where the team can view and leave feedback.",
+                description: "Register a prototype on VibeSharing. Creates a standalone prototype by default. To add it as a version under an existing project, provide parent_project_id. IMPORTANT: Before calling this, use resolve_target to confirm the collection and project name with the user. Do not auto-generate names without user confirmation. Returns the VibeSharing URL where the team can view and leave feedback.",
                 inputSchema: {
                     type: "object",
                     properties: {
@@ -600,6 +657,36 @@ server.setRequestHandler(types_js_1.ListToolsRequestSchema, async () => {
                 },
             },
             {
+                name: "share_html",
+                description: "Share a static HTML page on VibeSharing — the simplest way to share. No Vercel, no GitHub, no React wrapper. Just uploads the HTML and gives you a shareable link with the feedback widget built in. Use this for standalone HTML files, one-page prototypes, or any static content that doesn't need a build step. For large HTML files, use file_path instead of html to avoid MCP parameter size limits.",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        html: {
+                            type: "string",
+                            description: "The full HTML content to share. Either html or file_path is required.",
+                        },
+                        file_path: {
+                            type: "string",
+                            description: "Absolute path to an HTML file on disk. Use this instead of html for large files that may exceed MCP parameter size limits (~100KB). Either html or file_path is required.",
+                        },
+                        name: {
+                            type: "string",
+                            description: "Name for the prototype (e.g., 'Sunrise Glow Chatbox')",
+                        },
+                        prototype_id: {
+                            type: "string",
+                            description: "Optional: existing prototype ID to update",
+                        },
+                        collection_id: {
+                            type: "string",
+                            description: "Optional: collection to place it in",
+                        },
+                    },
+                    required: ["name"],
+                },
+            },
+            {
                 name: "create_collection",
                 description: "Create a new collection in your VibeSharing organization. Collections group related projects and prototypes. Use this before deploying a prototype if you need a new collection to put it in.",
                 inputSchema: {
@@ -619,7 +706,7 @@ server.setRequestHandler(types_js_1.ListToolsRequestSchema, async () => {
             },
             {
                 name: "deploy_files",
-                description: "Deploy a multi-file Next.js project to VibeSharing. Pushes files to GitHub, deploys to Vercel. Requires an existing prototype ID. IMPORTANT: Before calling this, use resolve_target to confirm the target prototype with the user. If the user hasn't specified where to deploy, do NOT proceed — ask first.",
+                description: "Deploy a multi-file Next.js project to VibeSharing. Pushes files to GitHub, deploys to Vercel. Requires an existing prototype ID. For large files, use file_paths instead of files to read from disk and avoid MCP parameter size limits (~100KB). IMPORTANT: Before calling this, use resolve_target to confirm the target prototype with the user. If the user hasn't specified where to deploy, do NOT proceed — ask first.",
                 inputSchema: {
                     type: "object",
                     properties: {
@@ -643,7 +730,25 @@ server.setRequestHandler(types_js_1.ListToolsRequestSchema, async () => {
                                 },
                                 required: ["path", "content"],
                             },
-                            description: "Array of files to deploy",
+                            description: "Array of files to deploy with inline content",
+                        },
+                        file_paths: {
+                            type: "array",
+                            items: {
+                                type: "object",
+                                properties: {
+                                    path: {
+                                        type: "string",
+                                        description: "Absolute path to the file on the local filesystem",
+                                    },
+                                    deploy_path: {
+                                        type: "string",
+                                        description: "File path in the deployed project (e.g., 'app/page.tsx'). Defaults to the filename.",
+                                    },
+                                },
+                                required: ["path"],
+                            },
+                            description: "Array of local file paths to read and deploy. Use this instead of files for large files that may exceed MCP parameter size limits.",
                         },
                         commit_message: {
                             type: "string",
@@ -654,7 +759,7 @@ server.setRequestHandler(types_js_1.ListToolsRequestSchema, async () => {
                             description: "Optional: Friendly name for the Vercel project URL (e.g., 'erg-v3-teams' → erg-v3-teams.vercel.app). On redeploy, renames the Vercel project if different from current name.",
                         },
                     },
-                    required: ["prototype_id", "files"],
+                    required: ["prototype_id"],
                 },
             },
             {
@@ -912,11 +1017,14 @@ server.setRequestHandler(types_js_1.CallToolRequestSchema, async (request) => {
                             sourceInfo = `\nWarning: Source upload failed: ${err instanceof Error ? err.message : "Unknown error"}`;
                         }
                     }
+                    const hierarchyNote = !params.parent_project_id
+                        ? "\n\nNote: This created a standalone prototype. To organize it under a project, use the 'Move to project' option on the VibeSharing dashboard."
+                        : "";
                     return {
                         content: [
                             {
                                 type: "text",
-                                text: `Prototype registered successfully!\n\nName: ${result.prototype?.name || params.name}\nVibeSharing URL: ${VIBESHARING_URL}/dashboard/projects/${protoId}\n${params.external_url ? `Live URL: ${params.external_url}` : ""}${sourceInfo}\n\nYour team can now view and leave feedback on this prototype.`,
+                                text: `Prototype registered successfully!\n\nName: ${result.prototype?.name || params.name}\nVibeSharing URL: ${VIBESHARING_URL}/dashboard/projects/${protoId}\n${params.external_url ? `Live URL: ${params.external_url}` : ""}${sourceInfo}\n\nYour team can now view and leave feedback on this prototype.${hierarchyNote}`,
                             },
                         ],
                     };
@@ -1137,7 +1245,7 @@ server.setRequestHandler(types_js_1.CallToolRequestSchema, async (request) => {
                             content: [
                                 {
                                     type: "text",
-                                    text: `Token is valid! Connected to ${VIBESHARING_URL}\n\nYour organization has ${result.prototypeCount} prototype(s).`,
+                                    text: `Token is valid! Connected to ${VIBESHARING_URL}\n\nMCP server version: ${CURRENT_VERSION}\nYour organization has ${result.prototypeCount} prototype(s).`,
                                 },
                             ],
                         };
@@ -1162,6 +1270,109 @@ server.setRequestHandler(types_js_1.CallToolRequestSchema, async (request) => {
                             {
                                 type: "text",
                                 text: `Source code uploaded successfully!\n\nPrototype ID: ${prototype_id}\nFilename: ${result.source?.filename || filename || "page.tsx"}\nSize: ${result.source?.size || source_code.length} characters\nStorage: ${result.source?.storage_option || storage_option || "permanent"}\n\nColleagues can download this from: ${VIBESHARING_URL}/dashboard/projects/${prototype_id}`,
+                            },
+                        ],
+                    };
+                }
+                case "share_html": {
+                    const { html: shareHtmlParam, file_path: shareFilePath, name: shareName, prototype_id: shareProtoId, collection_id: shareCollId, } = args;
+                    // Resolve HTML content from either inline or file path
+                    let shareHtml = shareHtmlParam;
+                    let bundledAssets = 0;
+                    if (!shareHtml && shareFilePath) {
+                        try {
+                            shareHtml = (0, fs_1.readFileSync)(shareFilePath, "utf-8");
+                        }
+                        catch (err) {
+                            return {
+                                content: [{ type: "text", text: `Error reading file: ${err instanceof Error ? err.message : "Unknown error"}` }],
+                                isError: true,
+                            };
+                        }
+                        // Auto-bundle: inline relative CSS, SVG, and images so the HTML is self-contained
+                        const htmlDir = shareFilePath.substring(0, shareFilePath.lastIndexOf("/")) || ".";
+                        // Inline CSS <link> tags
+                        shareHtml = shareHtml.replace(/<link\s+[^>]*rel=["']stylesheet["'][^>]*href=["']([^"']+)["'][^>]*\/?>/gi, (_match, href) => {
+                            if (href.startsWith("http://") || href.startsWith("https://"))
+                                return _match;
+                            try {
+                                const cssPath = (0, path_1.join)(htmlDir, href);
+                                const css = (0, fs_1.readFileSync)(cssPath, "utf-8");
+                                bundledAssets++;
+                                return `<style>/* ${href} */\n${css}</style>`;
+                            }
+                            catch {
+                                return _match; // Keep original if file not found
+                            }
+                        });
+                        // Inline SVG <img> tags as inline SVG elements
+                        shareHtml = shareHtml.replace(/<img\s+[^>]*src=["']([^"']+\.svg)["'][^>]*\/?>/gi, (_match, src) => {
+                            if (src.startsWith("http://") || src.startsWith("https://") || src.startsWith("data:"))
+                                return _match;
+                            try {
+                                const svgPath = (0, path_1.join)(htmlDir, src);
+                                const svg = (0, fs_1.readFileSync)(svgPath, "utf-8");
+                                // Extract class/style/alt from original img tag
+                                const classMatch = _match.match(/class=["']([^"']*)["']/);
+                                const styleMatch = _match.match(/style=["']([^"']*)["']/);
+                                let inlineSvg = svg.trim();
+                                if (classMatch)
+                                    inlineSvg = inlineSvg.replace("<svg", `<svg class="${classMatch[1]}"`);
+                                if (styleMatch)
+                                    inlineSvg = inlineSvg.replace("<svg", `<svg style="${styleMatch[1]}"`);
+                                bundledAssets++;
+                                return inlineSvg;
+                            }
+                            catch {
+                                return _match;
+                            }
+                        });
+                        // Inline PNG/JPG/GIF/WEBP as base64 data URIs
+                        shareHtml = shareHtml.replace(/<img\s+[^>]*src=["']([^"']+\.(png|jpg|jpeg|gif|webp))["'][^>]*\/?>/gi, (_match, src, ext) => {
+                            if (src.startsWith("http://") || src.startsWith("https://") || src.startsWith("data:"))
+                                return _match;
+                            try {
+                                const imgPath = (0, path_1.join)(htmlDir, src);
+                                const imgData = (0, fs_1.readFileSync)(imgPath);
+                                const mimeTypes = { png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp" };
+                                const mime = mimeTypes[ext.toLowerCase()] || "image/png";
+                                const dataUri = `data:${mime};base64,${imgData.toString("base64")}`;
+                                bundledAssets++;
+                                return _match.replace(src, dataUri);
+                            }
+                            catch {
+                                return _match;
+                            }
+                        });
+                    }
+                    if (!shareHtml || !shareName) {
+                        return {
+                            content: [{ type: "text", text: "Error: Either html or file_path is required, along with name." }],
+                            isError: true,
+                        };
+                    }
+                    // Check bundled size before sending
+                    const bundledSizeKB = Math.round(Buffer.byteLength(shareHtml, "utf-8") / 1024);
+                    if (bundledSizeKB > 4000) {
+                        return {
+                            content: [{ type: "text", text: `Error: The bundled HTML is ${bundledSizeKB}KB, which exceeds the 4MB upload limit. This usually means large images were inlined as base64.\n\nTo fix this:\n- Optimize images before sharing (compress PNGs/JPGs)\n- Host large images externally and use absolute URLs\n- Remove unused assets from the HTML` }],
+                            isError: true,
+                        };
+                    }
+                    if (bundledSizeKB > 2000) {
+                        console.error(`[vibesharing] Warning: bundled HTML is ${bundledSizeKB}KB — approaching 4MB limit`);
+                    }
+                    const shareResult = await client.deployStatic({
+                        html: shareHtml,
+                        prototypeName: shareName,
+                        prototypeId: shareProtoId,
+                        collectionId: shareCollId,
+                    });
+                    return {
+                        content: [
+                            {
+                                type: "text",
+                                text: `Shared!\n\nView URL: ${shareResult.viewUrl}\nPrototype ID: ${shareResult.prototypeId}\n\nVibeSharing: ${VIBESHARING_URL}/dashboard/projects/${shareResult.prototypeId}\n\nThis is a lightweight static share — no Vercel project, no GitHub repo, no build step. The feedback widget is included automatically.${bundledAssets > 0 ? `\n\n${bundledAssets} asset(s) auto-bundled (CSS, SVGs, images inlined into the HTML).` : ""}\n\n${shareResult.shareSummary ? `Share this with your team:\n${shareResult.shareSummary}` : ""}`,
                             },
                         ],
                     };
@@ -1256,13 +1467,69 @@ server.setRequestHandler(types_js_1.CallToolRequestSchema, async (request) => {
                     };
                 }
                 case "deploy_files": {
-                    const { prototype_id: deployProtoId, files, commit_message, deploy_name: deployName } = args;
+                    const { prototype_id: deployProtoId, files: inlineFiles, file_paths: filePaths, commit_message, deploy_name: deployName } = args;
+                    // Build combined files array from inline files and file paths
+                    const files = [...(inlineFiles || [])];
+                    if (filePaths && filePaths.length > 0) {
+                        for (const fp of filePaths) {
+                            try {
+                                const content = (0, fs_1.readFileSync)(fp.path, "utf-8");
+                                const deployPath = fp.deploy_path || (0, path_1.basename)(fp.path);
+                                files.push({ path: deployPath, content });
+                            }
+                            catch (err) {
+                                return {
+                                    content: [{ type: "text", text: `Error reading file "${fp.path}": ${err instanceof Error ? err.message : "Unknown error"}` }],
+                                    isError: true,
+                                };
+                            }
+                        }
+                    }
+                    if (files.length === 0) {
+                        return {
+                            content: [{ type: "text", text: "Error: Either files or file_paths is required." }],
+                            isError: true,
+                        };
+                    }
                     const deployResult = await client.deployFiles(deployProtoId, files, commit_message || "Deploy via MCP", deployName);
+                    // Feature 1: Auto-sync context if CLAUDE.md or AGENTS.md is present
+                    let contextSynced = false;
+                    try {
+                        const contextFile = files.find((f) => f.path.toLowerCase().endsWith("claude.md") || f.path.toLowerCase().endsWith("agents.md"));
+                        if (contextFile) {
+                            await client.syncContext(deployProtoId, contextFile.content);
+                            contextSynced = true;
+                        }
+                    }
+                    catch (err) {
+                        console.error("Auto-sync context failed (non-blocking):", err);
+                    }
+                    // Feature 2: Auto-generate feedback topics if none exist
+                    let topicsGenerated = false;
+                    try {
+                        const existingTopics = await client.listFeedbackTopics(deployProtoId);
+                        if (!existingTopics.topics || existingTopics.topics.length === 0) {
+                            client.generateFeedbackTopics(deployProtoId, [
+                                { title: "Does this prototype effectively solve the intended problem?", theme: "vision" },
+                                { title: "What would you change about the interaction design?", theme: "interaction" },
+                                { title: "Is this ready for the next stage of development?", theme: "feasibility" },
+                            ]).catch((err) => console.error("Auto-generate feedback topics failed (non-blocking):", err));
+                            topicsGenerated = true;
+                        }
+                    }
+                    catch (err) {
+                        console.error("Feedback topics check failed (non-blocking):", err);
+                    }
+                    const postDeployNotes = [];
+                    if (contextSynced)
+                        postDeployNotes.push("Context synced from CLAUDE.md.");
+                    if (topicsGenerated)
+                        postDeployNotes.push("Feedback topics auto-generated for your team.");
                     return {
                         content: [
                             {
                                 type: "text",
-                                text: `Deployed ${files.length} files!\n\n${deployResult.deployName ? `Deploy name: ${deployResult.deployName}\n` : ""}Live URL: ${deployResult.deployUrl || "Deploying..."}\nRepo: ${deployResult.repoUrl || "N/A"}\nCommit: ${deployResult.commitSha || "N/A"}\n\nVibeSharing: ${VIBESHARING_URL}/dashboard/projects/${deployProtoId}\n\nYour team can now view the prototype and leave feedback.`,
+                                text: `Deployed ${files.length} files!\n\n${deployResult.deployName ? `Deploy name: ${deployResult.deployName}\n` : ""}Live URL: ${deployResult.deployUrl || "Deploying..."}\nRepo: ${deployResult.repoUrl || "N/A"}\nCommit: ${deployResult.commitSha || "N/A"}\n\nVibeSharing: ${VIBESHARING_URL}/dashboard/projects/${deployProtoId}\n\nYour team can now view the prototype and leave feedback.${postDeployNotes.length > 0 ? "\n\n" + postDeployNotes.join("\n") : ""}`,
                             },
                         ],
                     };
@@ -1344,11 +1611,33 @@ server.setRequestHandler(types_js_1.CallToolRequestSchema, async (request) => {
                         };
                     }
                     const importResult = await client.importRepo(protoId, repo_url, deployName);
+                    // Feature 1: Context sync is handled server-side for repo imports (importContextFiles)
+                    // Feature 2: Auto-generate feedback topics if none exist
+                    let importTopicsGenerated = false;
+                    try {
+                        const existingTopics = await client.listFeedbackTopics(protoId);
+                        if (!existingTopics.topics || existingTopics.topics.length === 0) {
+                            client.generateFeedbackTopics(protoId, [
+                                { title: "Does this prototype effectively solve the intended problem?", theme: "vision" },
+                                { title: "What would you change about the interaction design?", theme: "interaction" },
+                                { title: "Is this ready for the next stage of development?", theme: "feasibility" },
+                            ]).catch((err) => console.error("Auto-generate feedback topics failed (non-blocking):", err));
+                            importTopicsGenerated = true;
+                        }
+                    }
+                    catch (err) {
+                        console.error("Feedback topics check failed (non-blocking):", err);
+                    }
+                    const importPostNotes = [];
+                    if (importTopicsGenerated)
+                        importPostNotes.push("Feedback topics auto-generated for your team.");
+                    if (importResult.indexNote)
+                        importPostNotes.push(`⚠ ${importResult.indexNote}`);
                     return {
                         content: [
                             {
                                 type: "text",
-                                text: `Repo imported and deploying!\n\n${importResult.deployName ? `Deploy name: ${importResult.deployName}\n` : ""}Live URL: ${importResult.deployUrl}\nRepo: ${importResult.repoUrl}\nVibeSharing: ${VIBESHARING_URL}/dashboard/projects/${protoId}\nFiles imported: ${importResult.fileCount || "unknown"}\n\nPushes to the VibeSharing repo will auto-deploy to Vercel.`,
+                                text: `Repo imported and deploying!\n\n${importResult.deployName ? `Deploy name: ${importResult.deployName}\n` : ""}Live URL: ${importResult.deployUrl}\nRepo: ${importResult.repoUrl}\nVibeSharing: ${VIBESHARING_URL}/dashboard/projects/${protoId}\nFiles imported: ${importResult.fileCount || "unknown"}\n\nPushes to the VibeSharing repo will auto-deploy to Vercel.${importPostNotes.length > 0 ? "\n\n" + importPostNotes.join("\n") : ""}`,
                             },
                         ],
                     };
@@ -1626,7 +1915,7 @@ server.setRequestHandler(types_js_1.CallToolRequestSchema, async (request) => {
                 case "diagnose": {
                     const result = await client.diagnose();
                     const lines = [
-                        "VibeSharing Health Check",
+                        `VibeSharing Health Check (MCP v${CURRENT_VERSION})`,
                         "========================",
                     ];
                     // Token status
@@ -1759,6 +2048,14 @@ server.setRequestHandler(types_js_1.CallToolRequestSchema, async (request) => {
     if (updateNotice && !toolResult.isError) {
         toolResult.content.unshift({ type: "text", text: updateNotice + "\n\n---\n" });
         updateNotice = null; // Only show once per session
+    }
+    // Prepend unread feedback summary on the first successful tool call
+    if (pendingFeedbackCheck && !toolResult.isError) {
+        const feedbackSummary = await pendingFeedbackCheck;
+        pendingFeedbackCheck = null; // Only show once per session
+        if (feedbackSummary) {
+            toolResult.content.unshift({ type: "text", text: feedbackSummary + "\n\n---\n" });
+        }
     }
     return toolResult;
 });

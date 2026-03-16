@@ -1,6 +1,6 @@
 {
   "name": "@vibesharingapp/mcp-server",
-  "version": "0.7.2",
+  "version": "0.9.3",
   "description": "MCP server for VibeSharing - register prototypes and get feedback directly from Claude Code",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -35,11 +35,10 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/erova/vibesharing.git",
-    "directory": "mcp-server"
+    "url": "git+https://github.com/erova/vibesharing-mcp.git"
   },
   "bugs": {
-    "url": "https://github.com/erova/vibesharing/issues"
+    "url": "https://github.com/erova/vibesharing-mcp/issues"
   },
   "homepage": "https://vibesharing.app",
   "mcpName": "io.github.erova/vibesharing",
