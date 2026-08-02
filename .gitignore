@@ -1,2 +1,11 @@
 node_modules
 .DS_Store
+
+# Build output. Never tracked here; npm publish builds it via prepublishOnly.
+dist
+
+# mcp-publisher login artifacts. These are credentials — they were tracked
+# from 2026-03-31 until 2026-08-02, and would have been copied to the PUBLIC
+# mirror repo by the sync workflow. Both had expired by then, but never again.
+.mcpregistry_github_token
+.mcpregistry_registry_token

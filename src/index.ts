@@ -12,6 +12,8 @@ import { readFileSync, writeFileSync, mkdirSync } from "fs";
 import { join, basename } from "path";
 import { homedir } from "os";
 
+const PKG = JSON.parse(readFileSync(join(__dirname, "..", "package.json"), "utf-8"));
+
 // VibeSharing API client
 class VibesharingClient {
   private baseUrl: string;
@@ -22,15 +24,16 @@ class VibesharingClient {
     this.token = token;
   }
 
-  private async request(path: string, options: RequestInit = {}) {
+  private async request(path: string, options: RequestInit & { skipTracking?: boolean } = {}) {
+    const { skipTracking, ...fetchOptions } = options;
     const url = `${this.baseUrl}${path}`;
     const response = await fetch(url, {
-      ...options,
+      ...fetchOptions,
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${this.token}`,
-        "X-Vibesharing-Client": "mcp",
-        ...options.headers,
+        ...(skipTracking ? {} : { "X-Vibesharing-Client": "mcp" }),
+        ...fetchOptions.headers,
       },
     });
 
@@ -66,10 +69,29 @@ class VibesharingClient {
     });
   }
 
-  async deployFiles(prototypeId: string, files: Array<{ path: string; content: string }>, commitMessage?: string, deployName?: string) {
+  async createCampaign(params: {
+    name: string;
+    goal?: string;
+    feedback_mode?: "open" | "guided";
+    feedback_layout?: "new_window" | "side_rail";
+    mode?: "password" | "allowlist";
+    password?: string;
+    expires_in_days?: number;
+    variant_group?: string;
+    randomize_order?: boolean;
+    questions?: unknown[];
+    prototypes?: Array<{ prototype_id: string; about?: string; questions?: unknown[] }>;
+  }) {
+    return this.request("/api/mcp/campaigns", {
+      method: "POST",
+      body: JSON.stringify(params),
+    });
+  }
+
+  async deployFiles(prototypeId: string, files: Array<{ path: string; content: string }>, commitMessage?: string, deployName?: string, template?: string, summary?: string, versionLabel?: string | null) {
     return this.request(`/api/prototypes/${prototypeId}/deploy-code`, {
       method: "POST",
-      body: JSON.stringify({ files, commitMessage, deployName }),
+      body: JSON.stringify({ files, commitMessage, deployName, template, summary, versionLabel }),
     });
   }
 
@@ -77,8 +99,20 @@ class VibesharingClient {
     return this.request("/api/prototypes");
   }
 
+  async listTemplates() {
+    return this.request("/api/org/templates");
+  }
+
+  async getTemplate(idOrSlug: string) {
+    return this.request(`/api/org/templates/${idOrSlug}`);
+  }
+
   async getPrototype(id: string) {
     return this.request(`/api/prototypes/${id}`);
+  }
+
+  async deletePrototype(id: string) {
+    return this.request(`/api/prototypes/${id}`, { method: "DELETE" });
   }
 
   async getFeedback(projectId: string, filters?: { status?: string; priority?: string; assigned_to?: string }) {
@@ -187,10 +221,10 @@ class VibesharingClient {
     });
   }
 
-  async importRepo(prototypeId: string, repoUrl: string, deployName?: string) {
+  async importRepo(prototypeId: string, repoUrl: string, deployName?: string, branch?: string, entryPoint?: string, versionLabel?: string | null) {
     return this.request("/api/git/import-repo", {
       method: "POST",
-      body: JSON.stringify({ prototypeId, repoUrl, deployName }),
+      body: JSON.stringify({ prototypeId, repoUrl, deployName, branch, entry_point: entryPoint, versionLabel }),
     });
   }
 
@@ -241,6 +275,18 @@ class VibesharingClient {
     });
   }
 
+  async trackEvent(event: string, properties?: Record<string, unknown>) {
+    try {
+      await this.request("/api/track", {
+        method: "POST",
+        body: JSON.stringify({ event, properties }),
+        skipTracking: true,
+      });
+    } catch {
+      // Tracking is fire-and-forget — never block the calling tool
+    }
+  }
+
   async generateFeedbackTopics(projectId: string, topics: Array<{ title: string; description?: string; theme?: string }>) {
     return this.request("/api/feedback-topics", {
       method: "POST",
@@ -259,9 +305,35 @@ class VibesharingClient {
     });
   }
 
-  async updateFeedbackBrief(projectId: string, brief: string, focus?: string) {
+  async forkPrototype(prototypeId: string, params?: { name?: string; deploy_name?: string; collection_id?: string }) {
+    return this.request(`/api/prototypes/${prototypeId}/fork`, {
+      method: "POST",
+      body: JSON.stringify(params || {}),
+    });
+  }
+
+  async listVersions(prototypeId: string, limit = 10) {
+    return this.request(`/api/prototypes/${prototypeId}/versions?limit=${limit}`);
+  }
+
+  async rollback(prototypeId: string, versionNumber: number) {
+    return this.request(`/api/prototypes/${prototypeId}/rollback`, {
+      method: "POST",
+      body: JSON.stringify({ version_number: versionNumber }),
+    });
+  }
+
+  async updatePrototype(prototypeId: string, updates: { name?: string; description?: string; external_url?: string }) {
+    return this.request(`/api/prototypes/${prototypeId}`, {
+      method: "PATCH",
+      body: JSON.stringify(updates),
+    });
+  }
+
+  async updateFeedbackBrief(projectId: string, brief: string, focus?: string, scopeNote?: string) {
     const updates: Record<string, unknown> = { feedback_brief: brief };
     if (focus) updates.feedback_focus = focus;
+    if (scopeNote !== undefined) updates.feedback_scope_note = scopeNote;
     return this.request(`/api/prototypes/${projectId}`, {
       method: "PATCH",
       body: JSON.stringify(updates),
@@ -327,11 +399,291 @@ function fuzzyMatch<T>(
     .sort((a, b) => b.score - a.score);
 }
 
+// ---------------------------------------------------------------------------
+// Feedback review formatting
+//
+// KEEP IN SYNC with the same block in lib/mcp-handlers.ts. This package builds
+// standalone (tsc, MCP SDK only) so it cannot import from the app.
+//
+// The shape of these strings is the feature: get_feedback is what an assistant
+// sees, so anything omitted here is context the assistant cannot use when it
+// drafts a change. Pin coordinates, page path, screenshot, the question being
+// answered, and reply text are all load-bearing for that.
+// ---------------------------------------------------------------------------
+
+interface FeedbackItem {
+  id: string;
+  user_name?: string | null;
+  guest_email?: string | null;
+  content: string;
+  created_at: string;
+  status?: string | null;
+  priority?: string | null;
+  assignee_name?: string | null;
+  resolved_at?: string | null;
+  page_path?: string | null;
+  x_percent?: number | null;
+  y_percent?: number | null;
+  screenshot_url?: string | null;
+  ai_theme?: string | null;
+  ai_priority?: string | null;
+  ai_summary?: string | null;
+  ai_actionable?: boolean | null;
+  feedback_type?: string | null;
+  effort_estimate?: string | null;
+  dependencies?: string | null;
+  blockers?: string | null;
+  recommended_approach?: string | null;
+  question?: string | null;
+  rating?: number | null;
+  selected_options?: string[] | null;
+  topic?: { title?: string | null; theme?: string | null } | null;
+  replies?: Array<{ user_name?: string | null; content: string }>;
+}
+
+const OPEN_FEEDBACK_STATUSES = ["open", "in_progress"];
+
+function feedbackStatus(f: FeedbackItem): string {
+  return f.status || (f.resolved_at ? "resolved" : "open");
+}
+
+function isOpenFeedback(f: FeedbackItem): boolean {
+  return OPEN_FEEDBACK_STATUSES.includes(feedbackStatus(f));
+}
+
+/**
+ * Who left this. Guests have no user_id and may not have given a name, so fall
+ * back to the email they were gated on before giving up and calling them
+ * anonymous.
+ */
+function feedbackAuthor(f: FeedbackItem): string {
+  const name = f.user_name?.trim();
+  if (name && name.toLowerCase() !== "anonymous") return name;
+  if (f.guest_email) return f.guest_email;
+  return name || "Anonymous";
+}
+
+/** Insertion-ordered so authors appear most-recent-comment-first. */
+function groupFeedbackByAuthor(feedback: FeedbackItem[]): Map<string, FeedbackItem[]> {
+  const groups = new Map<string, FeedbackItem[]>();
+  for (const f of feedback) {
+    const author = feedbackAuthor(f);
+    const existing = groups.get(author);
+    if (existing) existing.push(f);
+    else groups.set(author, [f]);
+  }
+  return groups;
+}
+
+/**
+ * Resolve a user-typed name ("Chris", "chris@acme.com") to one of the authors
+ * who actually left feedback. Exact-ish matches win; otherwise fall back to
+ * fuzzy so first names work.
+ */
+function resolveFeedbackAuthor(
+  query: string,
+  groups: Map<string, FeedbackItem[]>
+): { author: string } | { ambiguous: string[] } | null {
+  const authors = [...groups.keys()];
+  const q = query.trim().toLowerCase();
+
+  const exact = authors.filter((a) => a.toLowerCase() === q);
+  if (exact.length === 1) return { author: exact[0] };
+
+  const prefix = authors.filter((a) => a.toLowerCase().startsWith(q));
+  if (prefix.length === 1) return { author: prefix[0] };
+  if (prefix.length > 1) return { ambiguous: prefix };
+
+  const fuzzy = fuzzyMatch(query, authors, (a) => a, 0.45);
+  if (fuzzy.length === 0) return null;
+  if (fuzzy.length > 1 && fuzzy[1].score === fuzzy[0].score) {
+    return { ambiguous: fuzzy.map((m) => m.item) };
+  }
+  return { author: fuzzy[0].item };
+}
+
+function truncate(text: string, max: number): string {
+  const flat = text.replace(/\s+/g, " ").trim();
+  return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
+}
+
+/**
+ * POST /api/feedback appends "\n\n📍 /path — Page Title" to the comment body —
+ * a workaround from before prototype_feedback.page_path existed. Rows written
+ * since then carry both, so pull the marker out and let it stand in for
+ * page_path on the older rows that have nothing else.
+ */
+function splitRouteMarker(f: FeedbackItem): { content: string; path: string | null; title: string | null } {
+  const match = f.content.match(/\n+📍 ([^\n—]+?)(?: — ([^\n]+))?\s*$/);
+  if (!match) return { content: f.content.trim(), path: f.page_path || null, title: null };
+  return {
+    content: f.content.slice(0, match.index).trim(),
+    path: f.page_path || match[1].trim() || null,
+    title: match[2]?.trim() || null,
+  };
+}
+
+/** "design / high" — whichever of the AI triage labels are present. */
+function triageLabel(f: FeedbackItem): string {
+  const parts = [f.ai_theme, f.priority || f.ai_priority].filter(Boolean);
+  return parts.length ? parts.join(" / ") : "untriaged";
+}
+
+/**
+ * The full brief for one item — everything an assistant needs to draft a
+ * change without going back to the dashboard.
+ */
+function formatFeedbackBrief(f: FeedbackItem, position: number, total: number): string {
+  const header = `─────────────────────────────── ${position} of ${total} ──`;
+  const { content, path, title } = splitRouteMarker(f);
+  const lines: string[] = [
+    header,
+    `[${feedbackStatus(f)}] ${triageLabel(f)}${f.ai_actionable === false ? " · not actionable" : ""}`,
+    `"${content}"`,
+  ];
+
+  if (f.rating != null) lines.push(`  Rating: ${f.rating}/5`);
+  if (f.selected_options?.length) lines.push(`  Chose: ${f.selected_options.join(", ")}`);
+
+  // What prompted the comment: a study question is stored on the row, a guided
+  // topic is joined in.
+  const answering = f.question || f.topic?.title;
+  if (answering) lines.push(`  Answering: "${answering}"`);
+
+  const where: string[] = [];
+  if (path) where.push(title ? `${path} (${title})` : path);
+  if (f.x_percent != null && f.y_percent != null) {
+    where.push(`pinned at ${Math.round(f.x_percent)}% across, ${Math.round(f.y_percent)}% down`);
+  }
+  if (where.length) lines.push(`  Where: ${where.join(" · ")}`);
+  if (f.screenshot_url) lines.push(`  Screenshot: ${f.screenshot_url}`);
+  if (f.ai_summary) lines.push(`  AI summary: ${f.ai_summary}`);
+
+  if (f.feedback_type === "engineering") {
+    const eng = [
+      f.effort_estimate && `effort ${f.effort_estimate.toUpperCase()}`,
+      f.dependencies && `depends on ${f.dependencies}`,
+      f.blockers && `blocked by ${f.blockers}`,
+      f.recommended_approach && `suggested approach: ${f.recommended_approach}`,
+    ].filter(Boolean);
+    if (eng.length) lines.push(`  Engineering: ${eng.join(" · ")}`);
+  }
+
+  if (f.assignee_name) lines.push(`  Assigned to: ${f.assignee_name}`);
+
+  if (f.replies?.length) {
+    lines.push(`  Replies (${f.replies.length}):`);
+    for (const r of f.replies) {
+      lines.push(`    - ${r.user_name || "Someone"}: "${truncate(r.content, 160)}"`);
+    }
+  }
+
+  lines.push(`  feedback_id: ${f.id}`);
+  return lines.join("\n");
+}
+
+/** Per-person roll-up — the answer to "show me all the feedback". */
+function formatFeedbackRollup(feedback: FeedbackItem[]): string {
+  const groups = groupFeedbackByAuthor(feedback);
+  const openCount = feedback.filter(isOpenFeedback).length;
+  const people = groups.size;
+
+  const lines: string[] = [
+    `${feedback.length} item${feedback.length === 1 ? "" : "s"} from ${people} ` +
+      `${people === 1 ? "person" : "people"} — ${openCount} open, ${feedback.length - openCount} closed.`,
+    "",
+  ];
+
+  for (const [author, items] of groups) {
+    const open = items.filter(isOpenFeedback).length;
+    lines.push(`${author} — ${items.length} item${items.length === 1 ? "" : "s"} (${open} open)`);
+    for (const f of items) {
+      const { content, path } = splitRouteMarker(f);
+      const page = path ? ` · ${path}` : "";
+      lines.push(`  · [${feedbackStatus(f)}] ${triageLabel(f)}${page} — "${truncate(content, 100)}"`);
+      lines.push(`    ${f.id}`);
+    }
+    lines.push("");
+  }
+
+  const first = [...groups.keys()][0];
+  lines.push(
+    "To review one person's feedback item by item, call get_feedback again with " +
+      `author — e.g. author: "${first}".`
+  );
+  return lines.join("\n");
+}
+
+/**
+ * The instructions that make the review a conversation instead of a wall of
+ * text. Appended to every author queue.
+ */
+const FEEDBACK_REVIEW_PROTOCOL = `
+── How to run this review ──
+Work through the items above IN ORDER, one at a time. Do not summarize them all
+up front and do not act on any item before the user picks it.
+
+For each item:
+1. Show the user this item only — the comment, who left it, and where in the
+   prototype it points (page path, pin position, screenshot).
+2. Ask whether they want to build it, skip it, or talk it through.
+3. BUILD — read the code the feedback actually points at, then draft a concrete
+   implementation prompt: the specific change, the files involved, and what
+   should visibly differ afterward. Show that prompt and wait for approval.
+   Once approved, call triage_feedback(feedback_ids: [id], status: "in_progress")
+   so the person who left it can see it is being worked on, then make the change.
+4. SKIP — leave it untouched and move on. Do not change its status; a skipped
+   item stays open so it can be revisited.
+5. TALK IT THROUGH — discuss it, then come back to build or skip. Nothing is
+   written to VibeSharing during this step.
+Then move to the next item.
+
+When every item is decided and the changes are deployed, call
+close_feedback_loop with a note per item you built. That marks them resolved and
+emails each stakeholder what changed.`.trim();
+
+function formatAuthorQueue(author: string, items: FeedbackItem[]): string {
+  const open = items.filter(isOpenFeedback).length;
+  const briefs = items.map((f, i) => formatFeedbackBrief(f, i + 1, items.length));
+  return [
+    `${author} left ${items.length} item${items.length === 1 ? "" : "s"} (${open} open).`,
+    "",
+    briefs.join("\n\n"),
+    "",
+    FEEDBACK_REVIEW_PROTOCOL,
+  ].join("\n");
+}
+
 // ---- Version tracking & What's New ----
 
-const CURRENT_VERSION = "0.9.3";
+const CURRENT_VERSION = PKG.version as string;
 
 const WHATS_NEW: Record<string, string> = {
+  // Keyed 0.14.1 rather than 0.14.0 so people already on 0.14.0 still see it —
+  // getWhatsNew only shows notes strictly newer than the version last run.
+  "0.14.1": [
+    "VibeSharing MCP v0.14 — Review feedback person by person:",
+    "",
+    "• get_feedback now rolls up by author — \"9 items from 4 people, 6 open\" —",
+    "  instead of returning one flat list.",
+    "• Pass author to walk one person's feedback one item at a time. Each item",
+    "  carries the page it points at, the pin position, the screenshot, the",
+    "  question it answers, and any replies.",
+    "• Decide each one as you go: build it, skip it, or talk it through. Approving",
+    "  marks the item in_progress so the person who left it can see it's being",
+    "  worked on; skipping leaves it open.",
+  ].join("\n"),
+  "0.10.0": [
+    "VibeSharing MCP v0.10.0 — Version Control & Forking:",
+    "",
+    "• fork_prototype — Create a copy of any prototype with its own URL. The original",
+    "  stays untouched. Use this to experiment with variants safely.",
+    "• list_versions — Browse deploy history with version numbers, file manifests,",
+    "  commit info, and rollback availability.",
+    "• rollback_deploy — Restore a previous version. For git deploys, re-pushes the",
+    "  old files. For static deploys, restores the snapshot.",
+    "• Every deploy now auto-tracks version numbers (v1, v2, v3...) with file hashes.",
+  ].join("\n"),
   "0.6.0": [
     "🆕 VibeSharing MCP v0.6.0 — What's New:",
     "",
@@ -352,11 +704,26 @@ const WHATS_NEW: Record<string, string> = {
   ].join("\n"),
   "0.4.0": [
     "• resolve_target tool — Fuzzy-matches collection/project names.",
-    "• Named deployments — Set friendly Vercel URLs with deploy_name.",
+    "• Named deployments — Set friendly deploy URLs with deploy_name.",
     "• Fuzzy search on list_collections and list_prototypes.",
     "• Guardrails on deploy tools.",
   ].join("\n"),
 };
+
+/**
+ * Compare two semver-ish strings numerically. A plain string compare gets this
+ * wrong the moment a part reaches double digits — "0.6.0" > "0.13.0" is true
+ * lexically, which would replay years-old notes to anyone upgrading.
+ */
+function compareVersions(a: string, b: string): number {
+  const pa = a.split(".").map((n) => parseInt(n, 10) || 0);
+  const pb = b.split(".").map((n) => parseInt(n, 10) || 0);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const diff = (pa[i] || 0) - (pb[i] || 0);
+    if (diff !== 0) return diff > 0 ? 1 : -1;
+  }
+  return 0;
+}
 
 function getWhatsNew(): string | null {
   try {
@@ -380,13 +747,11 @@ function getWhatsNew(): string | null {
 
     if (lastVersion === CURRENT_VERSION) return null;
 
-    // Collect all changelogs newer than lastVersion
-    const notes: string[] = [];
-    for (const [ver, note] of Object.entries(WHATS_NEW)) {
-      if (!lastVersion || ver > lastVersion) {
-        notes.push(note);
-      }
-    }
+    // Collect all changelogs newer than lastVersion, newest first
+    const notes = Object.entries(WHATS_NEW)
+      .filter(([ver]) => !lastVersion || compareVersions(ver, lastVersion) > 0)
+      .sort(([a], [b]) => compareVersions(b, a))
+      .map(([, note]) => note);
 
     return notes.length > 0 ? notes.join("\n\n") : null;
   } catch {
@@ -400,6 +765,18 @@ let pendingWhatsNew: string | null = getWhatsNew();
 // Get configuration from environment
 const VIBESHARING_URL = process.env.VIBESHARING_URL || "https://vibesharing.app";
 const VIBESHARING_TOKEN = process.env.VIBESHARING_TOKEN;
+
+// Post-deploy feedback prompt — instructs the AI client to ask the user about feedback focus
+function buildFeedbackPrompt(prototypeId: string, hasManualTopics: boolean): string {
+  if (hasManualTopics) {
+    return "";
+  }
+  return `IMPORTANT — ask the user this before moving on:
+
+What should reviewers focus on? (design / usability / feasibility / everything / skip)
+
+If they answer, call generate_feedback_topics with project_id "${prototypeId}" and 3-5 questions matching their focus. If they say "skip", move on.`;
+}
 
 if (!VIBESHARING_TOKEN) {
   console.error("Error: VIBESHARING_TOKEN environment variable is required");
@@ -442,10 +819,10 @@ let updateNotice: string | null = null;
 
 const client = new VibesharingClient(VIBESHARING_URL, VIBESHARING_TOKEN);
 
-// Check for unread feedback (non-blocking — runs in background)
+// Check for unread feedback (non-blocking — runs in background, untracked)
 let pendingFeedbackCheck: Promise<string | null> = (async () => {
   try {
-    const result = await client.listPrototypes();
+    const result = await (client as any).request("/api/prototypes", { skipTracking: true });
     const prototypes = (result.prototypes || []).slice(0, 10) as Array<{
       id: string;
       name: string;
@@ -461,7 +838,7 @@ let pendingFeedbackCheck: Promise<string | null> = (async () => {
     await Promise.all(
       prototypes.map(async (proto) => {
         try {
-          const fbResult = await client.getFeedback(proto.id, { status: "open" });
+          const fbResult = await (client as any).request(`/api/feedback?projectId=${proto.id}&status=open`, { skipTracking: true });
           const feedback = (fbResult.feedback || []) as Array<{
             user_name: string;
             content: string;
@@ -501,6 +878,50 @@ let pendingFeedbackCheck: Promise<string | null> = (async () => {
   }
 })();
 
+// Welcome message for new users (non-blocking — runs in background)
+let pendingWelcome: Promise<string | null> = (async () => {
+  try {
+    const [tokenResult, templateResult] = await Promise.all([
+      client.verifyToken(),
+      client.listTemplates(),
+    ]);
+
+    if (!tokenResult.valid) return null;
+
+    const protoCount = tokenResult.prototypeCount || 0;
+    const templates = ((templateResult as any).templates || []).filter(
+      (t: { is_active: boolean }) => t.is_active
+    );
+
+    // New user: no prototypes yet
+    if (protoCount === 0) {
+      let welcome = `👋 Welcome to VibeSharing! This is your first session.\n\n`;
+      welcome += `VibeSharing lets you share prototypes with your team and collect feedback. Here's how it works:\n\n`;
+      welcome += `1. Build something — a dashboard, a form, a landing page, anything\n`;
+      welcome += `2. When the user says "share this", "publish this", "push this", or anything like that — deploy it to VibeSharing\n`;
+      welcome += `3. They'll get a live URL they can send to their team for feedback\n`;
+
+      if (templates.length > 0) {
+        const tplNames = templates.map((t: { name: string }) => t.name).join(", ");
+        welcome += `\nYour org has design system templates: **${tplNames}**. Ask the user if they'd like to start with one — it'll set up the right colors, fonts, and layout patterns automatically.`;
+      }
+
+      return welcome;
+    }
+
+    // Returning user with templates they might not know about
+    // Only nudge if they have few prototypes (still learning the tool)
+    if (protoCount <= 3 && templates.length > 0) {
+      const tplNames = templates.map((t: { name: string }) => t.name).join(", ");
+      return `💡 Reminder: your org has design system templates (${tplNames}). If the user is starting a new prototype, ask if they'd like to use one — it sets up the right brand colors and layout patterns automatically.`;
+    }
+
+    return null;
+  } catch {
+    return null;
+  }
+})();
+
 // Create MCP server
 const server = new Server(
   {
@@ -512,6 +933,7 @@ const server = new Server(
       tools: {},
       resources: {},
     },
+    instructions: `VibeSharing MCP Server v${CURRENT_VERSION} — helps users share prototypes with their team and collect feedback.\n\nWhen the user says "share this", "publish this", "push this to VibeSharing", or anything suggesting they want others to see their work — deploy it. If their org has design system templates and they're starting something new, ask which template they'd like to use so the prototype matches their brand from the start.`,
   }
 );
 
@@ -536,7 +958,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             external_url: {
               type: "string",
-              description: "URL where the prototype is deployed (e.g., https://my-app.vercel.app)",
+              description: "URL where the prototype is deployed (e.g., https://my-app.vercel.app or https://my-app.netlify.app)",
             },
             parent_project_id: {
               type: "string",
@@ -589,13 +1011,18 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "get_feedback",
         description:
-          "Get feedback and comments for a specific prototype. Can filter by status (open, in_progress, resolved, wont_fix, deferred), priority (critical, high, medium, low), or assignee.",
+          "Get feedback and comments for a prototype. Called without `author`, it returns a roll-up of who left feedback and what they said — use this for 'show me the feedback'. Called with `author`, it returns that person's items as an ordered queue with full context (page path, pin position, screenshot, the question being answered, replies) plus instructions for reviewing them one at a time so the owner can decide to build, skip, or discuss each one. Can also filter by status, priority, or assignee.",
         inputSchema: {
           type: "object",
           properties: {
             project_id: {
               type: "string",
               description: "The VibeSharing project/prototype ID",
+            },
+            author: {
+              type: "string",
+              description:
+                "Review one person's feedback item by item. Accepts a first name, full name, or email — matched against the people who actually left feedback.",
             },
             status: {
               type: "string",
@@ -747,13 +1174,37 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "deploy_prototype",
         description:
-          "Deploy code directly to VibeSharing. This deploys your code to Vercel and registers it as a prototype in one step. IMPORTANT: Before calling this, use resolve_target to confirm the collection, project name, and deploy name with the user. Do not deploy without user confirmation on where it should go.",
+          "Deploy code directly to VibeSharing. Deploys to Vercel with a Git repo and registers it as a prototype in one step. Supports single-file (code) or multi-file (files/file_paths) deploys. For multi-page prototypes, use files or file_paths instead of code. IMPORTANT: Always ask the user WHERE this should go BEFORE deploying — which collection and project. Use resolve_target to confirm. Pass collection_id and parent_project_id so the prototype lands in the right place from the start.",
         inputSchema: {
           type: "object",
           properties: {
             code: {
               type: "string",
-              description: "The React/Next.js page code to deploy (typically a page.tsx file)",
+              description: "Single-file shorthand: the React/Next.js page code (deployed as app/page.tsx). Use 'files' or 'file_paths' instead for multi-file prototypes.",
+            },
+            files: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: {
+                  path: { type: "string", description: "File path relative to project root (e.g., 'app/page.tsx', 'app/globals.css')" },
+                  content: { type: "string", description: "File content" },
+                },
+                required: ["path", "content"],
+              },
+              description: "Multi-file deploy: array of files with paths and content. Overrides 'code' if both provided.",
+            },
+            file_paths: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: {
+                  path: { type: "string", description: "Absolute path to the file on disk" },
+                  deploy_path: { type: "string", description: "File path in the deployed project (e.g., 'app/page.tsx'). Defaults to the filename." },
+                },
+                required: ["path"],
+              },
+              description: "Multi-file deploy from disk: reads files and deploys them. Use instead of 'files' for large files that may exceed MCP parameter size limits.",
             },
             name: {
               type: "string",
@@ -763,8 +1214,36 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: "string",
               description: "Optional: existing prototype ID to update (creates new if not provided)",
             },
+            collection_id: {
+              type: "string",
+              description: "Optional: Collection ID to place the prototype in. Skips the confirmation prompt if provided.",
+            },
+            parent_project_id: {
+              type: "string",
+              description: "Optional: Parent project ID if this is a version/iteration of an existing project.",
+            },
+            deploy_name: {
+              type: "string",
+              description: "Optional: Friendly name for the deploy URL (e.g., 'checkout-v2')",
+            },
+            commit_message: {
+              type: "string",
+              description: "Optional: Git commit message (default: 'Deploy via MCP')",
+            },
+            summary: {
+              type: "string",
+              description: "IMPORTANT: 1-2 sentence summary of what was built or changed, written for stakeholders (not developers). This appears in email notifications to the team. Example: 'Added meeting scheduling with template picker and drag-to-reorder agenda items.' Always provide this.",
+            },
+            version_label: {
+              type: "string",
+              description: "Optional but encouraged on re-deploys: short title for this version (≤60 chars) like 'dark theme', 'calendar variant', 'tightened spacing'. Renders as the version row's headline in the Versions panel — distinct from `summary` (what changed) and `commit_message` (git provenance). Ask the user when they describe a meaningful change between versions.",
+            },
+            template: {
+              type: "string",
+              description: "Optional: Design system template to apply. Available templates depend on your org.",
+            },
           },
-          required: ["code", "name"],
+          required: ["name"],
         },
       },
       {
@@ -818,9 +1297,85 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         },
       },
       {
+        name: "create_campaign",
+        description:
+          "Create a research campaign (customer/user study) in VibeSharing. A campaign bundles several prototypes behind one gated portal and asks reviewers structured questions. Great for A/B/C preference tests across variants. Creates the campaign as a DRAFT — review and open/send it from the dashboard (opening applies access gating and invites the cohort). Each question can collect a 1–5 star rating, a multiple choice, and/or a free comment. Ask the user which prototypes and what to ask before calling.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            name: { type: "string", description: "Campaign name (e.g., 'Risk Maestro — visual direction test')" },
+            goal: { type: "string", description: "The research goal / participant brief shown at the start of the portal." },
+            feedback_mode: {
+              type: "string",
+              enum: ["guided", "open"],
+              description: "'guided' (default) walks reviewers through your questions per prototype; 'open' just collects free comments.",
+            },
+            variant_group: {
+              type: "string",
+              description: "Optional label to group the prototypes as variants of one thing (e.g., 'risk-maestro'), so they read as A/B/C.",
+            },
+            randomize_order: {
+              type: "boolean",
+              description: "Randomize the prototype order per participant and show them blind as 'Option A/B/C' (labels stay tied to each prototype). Best for unbiased preference tests. Researchers still see which letter is which in the dashboard.",
+            },
+            feedback_layout: {
+              type: "string",
+              enum: ["new_window", "side_rail"],
+              description: "Where participants answer. 'new_window' (default) opens the prototype in its own window with questions in the launching tab; 'side_rail' embeds the prototype on the left with questions in a rail beside it. side_rail auto-falls back to new_window on narrow screens or when an external site blocks embedding.",
+            },
+            expires_in_days: { type: "number", description: "Optional: auto-expire the campaign after N days once opened." },
+            questions: {
+              type: "array",
+              description: "Optional campaign-level questions asked once after all prototypes (e.g., an overall preference question).",
+              items: {
+                type: "object",
+                properties: {
+                  prompt: { type: "string", description: "The question text." },
+                  rating: { type: "boolean", description: "Include a 1–5 star rating." },
+                  comment: { type: "boolean", description: "Include a free-text comment box." },
+                  choice: { type: "boolean", description: "Include a multiple-choice question (provide options)." },
+                  options: { type: "array", items: { type: "string" }, description: "Choices for a multiple-choice question." },
+                  multi: { type: "boolean", description: "Allow selecting multiple options." },
+                },
+                required: ["prompt"],
+              },
+            },
+            prototypes: {
+              type: "array",
+              description: "The prototypes to include, in order. Each gets its own intro and questions.",
+              items: {
+                type: "object",
+                properties: {
+                  prototype_id: { type: "string", description: "The VibeSharing prototype ID to include." },
+                  about: { type: "string", description: "Optional short intro shown above this prototype in the portal." },
+                  questions: {
+                    type: "array",
+                    description: "Questions asked for this prototype (rating / choice / comment, same shape as campaign questions).",
+                    items: {
+                      type: "object",
+                      properties: {
+                        prompt: { type: "string" },
+                        rating: { type: "boolean" },
+                        comment: { type: "boolean" },
+                        choice: { type: "boolean" },
+                        options: { type: "array", items: { type: "string" } },
+                        multi: { type: "boolean" },
+                      },
+                      required: ["prompt"],
+                    },
+                  },
+                },
+                required: ["prototype_id"],
+              },
+            },
+          },
+          required: ["name"],
+        },
+      },
+      {
         name: "deploy_files",
         description:
-          "Deploy a multi-file Next.js project to VibeSharing. Pushes files to GitHub, deploys to Vercel. Requires an existing prototype ID. For large files, use file_paths instead of files to read from disk and avoid MCP parameter size limits (~100KB). IMPORTANT: Before calling this, use resolve_target to confirm the target prototype with the user. If the user hasn't specified where to deploy, do NOT proceed — ask first.",
+          "Deploy a multi-file Next.js project to VibeSharing. Pushes files to GitHub, deploys to Vercel. Requires an existing prototype ID. For large files, use file_paths instead of files to read from disk and avoid MCP parameter size limits (~100KB). IMPORTANT: If the code is already in a GitHub repo, use import_repo instead — it's faster, supports branches, and has no payload size limits. Only use deploy_files for code you generated or small projects. Before calling this, use resolve_target to confirm the target prototype with the user.",
         inputSchema: {
           type: "object",
           properties: {
@@ -868,9 +1423,21 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: "string",
               description: "Optional: Git commit message (default: 'Deploy via MCP')",
             },
+            summary: {
+              type: "string",
+              description: "IMPORTANT: 1-2 sentence summary of what was built or changed, written for stakeholders (not developers). This appears in email notifications to the team. Example: 'Redesigned the risk dashboard with sortable columns and export to PDF.' Always provide this.",
+            },
+            version_label: {
+              type: "string",
+              description: "Optional but encouraged on re-deploys: short title for this version (≤60 chars) like 'dark theme', 'calendar variant'. Renders as the version row's headline in the Versions panel.",
+            },
             deploy_name: {
               type: "string",
-              description: "Optional: Friendly name for the Vercel project URL (e.g., 'erg-v3-teams' → erg-v3-teams.vercel.app). On redeploy, renames the Vercel project if different from current name.",
+              description: "Optional: Friendly name for the deploy URL (e.g., 'erg-v3-teams'). On redeploy, renames the hosting project if different from current name.",
+            },
+            template: {
+              type: "string",
+              description: "Optional: Design system template to apply. Available templates: 'atlas-light' (clean institutional), 'atlas-dark' (dark variant), 'atlas-lens' (product-focused dark). Templates inject themed CSS and a starter page. Diligent org only.",
             },
           },
           required: ["prototype_id"],
@@ -879,7 +1446,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "import_repo",
         description:
-          "Import an existing GitHub repo into VibeSharing. Pulls the code into a VibeSharing-hosted repo and deploys it to Vercel. IMPORTANT: Before calling this, use resolve_target to confirm the collection, project name, and deploy name with the user. Do not import without user confirmation on where it should go and what it should be called.",
+          "Import an existing GitHub repo into VibeSharing. PREFER THIS over deploy_files when code is already in a GitHub repo — it fetches files server-side (no payload size limits) and supports branch selection via the branch parameter. Pulls code into a VibeSharing-hosted repo and deploys to Vercel. IMPORTANT: Before calling this, use resolve_target to confirm the collection, project name, and deploy name with the user.",
         inputSchema: {
           type: "object",
           properties: {
@@ -909,7 +1476,19 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             deploy_name: {
               type: "string",
-              description: "Optional: Friendly name for the Vercel project URL (e.g., 'erg-v3-teams' → erg-v3-teams.vercel.app). Lowercase, hyphens allowed, max 100 chars. Auto-derived from 'name' if omitted.",
+              description: "Optional: Friendly name for the deploy URL (e.g., 'erg-v3-teams'). Lowercase, hyphens allowed, max 100 chars. Auto-derived from 'name' if omitted.",
+            },
+            branch: {
+              type: "string",
+              description: "Optional: Git branch to import from (e.g., 'subsidiary-governance-workflows'). Defaults to the repo's default branch (usually 'main').",
+            },
+            entry_point: {
+              type: "string",
+              description: "Optional: HTML file to use as the landing page (e.g., 'my-page.html'). Creates a redirect from index.html. Use for static HTML sites with no index.html.",
+            },
+            version_label: {
+              type: "string",
+              description: "Optional but encouraged on re-imports: short title for this version (≤60 chars) like 'fixed nav spacing', 'added dark mode'. Renders as the version row's headline in the Versions panel.",
             },
           },
           required: ["repo_url"],
@@ -935,6 +1514,69 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               description: "Desired Vercel deploy name to check availability for (e.g., 'erg-v3-teams').",
             },
           },
+        },
+      },
+      {
+        name: "list_templates",
+        description:
+          "List design system templates available in your org. Call this when the user asks about design systems, branding, templates, or wants their prototype to match their org's look and feel. Templates provide themed CSS variables, starter pages, and AI design instructions.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            active_only: {
+              type: "boolean",
+              description: "Only show active templates (default: true)",
+            },
+          },
+        },
+      },
+      {
+        name: "get_template",
+        description:
+          "Get the full details of a design system template — CSS variables, starter page, and design instructions. Use this BEFORE writing any code to ensure your prototype matches the org's design system from the start.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            template: {
+              type: "string",
+              description:
+                "Template slug or ID (e.g., 'atlas-light'). Use list_templates to see available options.",
+            },
+          },
+          required: ["template"],
+        },
+      },
+      {
+        name: "quick_prototype",
+        description:
+          "Create and deploy a themed prototype in one step. Picks a design system template, registers a new prototype, and deploys generated code — all from a single description. The fastest way to go from idea to live URL.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            description: {
+              type: "string",
+              description:
+                "What the prototype should show or do (e.g., 'a dashboard for monitoring deploy status with a table of recent deploys and status badges')",
+            },
+            template: {
+              type: "string",
+              description:
+                "Template slug to use. If omitted, lists available templates and picks the best match.",
+            },
+            name: {
+              type: "string",
+              description: "Name for the prototype. Auto-generated from description if omitted.",
+            },
+            collection_id: {
+              type: "string",
+              description: "Optional: Collection to place the prototype in",
+            },
+            parent_project_id: {
+              type: "string",
+              description: "Optional: Parent project ID",
+            },
+          },
+          required: ["description"],
         },
       },
       {
@@ -1044,6 +1686,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               },
               description: "Array of feedback questions to create. Generate 3-5 based on what you built. Weight toward the focus theme (e.g., if focus is 'feasibility', 2-3 questions should be feasibility-themed). Not required when focus is 'awareness'.",
             },
+            scope_note: {
+              type: "string",
+              description: "Optional: What stakeholders should NOT focus on, or scope boundaries (e.g., 'Visual polish is not ready yet — focus on the interaction flow'). Shown as a disclaimer on the share page.",
+            },
           },
           required: ["project_id"],
         },
@@ -1055,6 +1701,20 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: {
           type: "object",
           properties: {},
+        },
+      },
+      {
+        name: "validate_project",
+        description:
+          "Validate that the current project will build successfully before deploying. Checks for common issues: missing framework dependencies (next, vite, nuxt, astro, gatsby), missing build scripts, conflicting configs. Use this before deploy_files or deploy_prototype to catch build failures early. Returns warnings and errors with fix suggestions.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            project_path: {
+              type: "string",
+              description: "Absolute path to the project directory to validate. Defaults to the current working directory.",
+            },
+          },
         },
       },
       {
@@ -1078,6 +1738,113 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
           },
           required: ["subject", "description"],
+        },
+      },
+      {
+        name: "list_versions",
+        description:
+          "List version history for a prototype. Shows all deploys with version numbers, file counts, commit info, and whether rollback is available. Use this to review what changed between deploys or to find a version to rollback to.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            prototype_id: {
+              type: "string",
+              description: "The VibeSharing prototype ID",
+            },
+            limit: {
+              type: "number",
+              description: "Max versions to return (default: 10, max: 50)",
+            },
+          },
+          required: ["prototype_id"],
+        },
+      },
+      {
+        name: "rollback_deploy",
+        description:
+          "Rollback a prototype to a previous version. For git deploys, re-pushes the old files to GitHub. For static deploys, restores the HTML snapshot. IMPORTANT: Always call list_versions first and confirm the target version with the user before rolling back.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            prototype_id: {
+              type: "string",
+              description: "The VibeSharing prototype ID",
+            },
+            version_number: {
+              type: "number",
+              description: "The version number to rollback to (from list_versions)",
+            },
+          },
+          required: ["prototype_id", "version_number"],
+        },
+      },
+      {
+        name: "fork_prototype",
+        description:
+          "Fork a prototype: creates a new copy with its own deploy URL, linked back to the original. The original is preserved untouched. Use this when the user wants to explore a variant, experiment with changes, or branch from an existing prototype without risking the original. IMPORTANT: Confirm the fork name and target collection with the user before proceeding.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            prototype_id: {
+              type: "string",
+              description: "The source prototype ID to fork from",
+            },
+            name: {
+              type: "string",
+              description: "Name for the fork (default: '{original name} (fork)')",
+            },
+            deploy_name: {
+              type: "string",
+              description: "Optional: Friendly name for the deploy URL (e.g., 'login-v2-dark')",
+            },
+            collection_id: {
+              type: "string",
+              description: "Optional: Collection to place the fork in. Defaults to the same collection as the original.",
+            },
+          },
+          required: ["prototype_id"],
+        },
+      },
+      {
+        name: "delete_prototype",
+        description:
+          "Delete a prototype from VibeSharing. Removes the prototype, its deployments, version history, and feedback. This is irreversible. IMPORTANT: Always confirm with the user before deleting. Only the prototype creator or an org admin can delete.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            prototype_id: {
+              type: "string",
+              description: "The prototype ID to delete",
+            },
+          },
+          required: ["prototype_id"],
+        },
+      },
+      {
+        name: "update_prototype",
+        description:
+          "Update a prototype's metadata (name, description, external URL). Use this to rename prototypes, update descriptions, or fix URLs. Does NOT create a new entry — modifies the existing one in place.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            prototype_id: {
+              type: "string",
+              description: "The prototype ID to update",
+            },
+            name: {
+              type: "string",
+              description: "New name for the prototype",
+            },
+            description: {
+              type: "string",
+              description: "New description",
+            },
+            external_url: {
+              type: "string",
+              description: "New external URL",
+            },
+          },
+          required: ["prototype_id"],
         },
       },
     ],
@@ -1167,11 +1934,22 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           ? "\n\nNote: This created a standalone prototype. To organize it under a project, use the 'Move to project' option on the VibeSharing dashboard."
           : "";
 
+        // Template nudge for new prototypes
+        let registerTemplateNudge = "";
+        try {
+          const tplResult = await client.listTemplates();
+          const activeTpls = ((tplResult as any).templates || []).filter((t: { is_active: boolean }) => t.is_active);
+          if (activeTpls.length > 0) {
+            const tplNames = activeTpls.map((t: { name: string; slug: string }) => `${t.name} (\`${t.slug}\`)`).join(", ");
+            registerTemplateNudge = `\n\n💡 **Design system templates available:** ${tplNames}. Ask the user which template they'd like to use, then call \`get_template\` with the slug to set up the project with that design system.`;
+          }
+        } catch { /* non-blocking */ }
+
         return {
           content: [
             {
               type: "text",
-              text: `Prototype registered successfully!\n\nName: ${result.prototype?.name || params.name}\nVibeSharing URL: ${VIBESHARING_URL}/dashboard/projects/${protoId}\n${params.external_url ? `Live URL: ${params.external_url}` : ""}${sourceInfo}\n\nYour team can now view and leave feedback on this prototype.${hierarchyNote}`,
+              text: `Prototype registered successfully!\n\nName: ${result.prototype?.name || params.name}\nVibeSharing URL: ${VIBESHARING_URL}/dashboard/projects/${protoId}\n${params.external_url ? `Live URL: ${params.external_url}` : ""}${sourceInfo}\n\nYour team can now view and leave feedback on this prototype.${hierarchyNote}${registerTemplateNudge}`,
             },
           ],
         };
@@ -1266,8 +2044,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "get_feedback": {
-        const { project_id, status: statusFilter, priority: priorityFilter, assigned_to: assignedToFilter } = args as {
+        const { project_id, author, status: statusFilter, priority: priorityFilter, assigned_to: assignedToFilter } = args as {
           project_id: string;
+          author?: string;
           status?: string;
           priority?: string;
           assigned_to?: string;
@@ -1277,7 +2056,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           priority: priorityFilter,
           assigned_to: assignedToFilter,
         });
-        const feedback = result.feedback || [];
+        const feedback: FeedbackItem[] = result.feedback || [];
 
         if (feedback.length === 0) {
           const filterNote = statusFilter || priorityFilter || assignedToFilter
@@ -1293,37 +2072,45 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           };
         }
 
-        const feedbackList = feedback
-          .map(
-            (f: {
-              id: string;
-              user_name: string;
-              content: string;
-              created_at: string;
-              status?: string;
-              priority?: string | null;
-              assigned_to?: string | null;
-              assignee_name?: string | null;
-              resolved_at?: string;
-              replies?: Array<{ user_name: string; content: string }>;
-            }) => {
-              const itemStatus = f.status || (f.resolved_at ? "resolved" : "open");
-              const priorityLabel = f.priority ? ` [${f.priority.toUpperCase()}]` : "";
-              const assigneeLabel = f.assignee_name ? ` → ${f.assignee_name}` : "";
-              const replies =
-                f.replies && f.replies.length > 0
-                  ? `\n  Replies: ${f.replies.length}`
-                  : "";
-              return `- [${itemStatus}]${priorityLabel}${assigneeLabel} ${f.user_name}: "${f.content}"\n  ID: ${f.id}\n  ${new Date(f.created_at).toLocaleDateString()}${replies}`;
-            }
-          )
-          .join("\n\n");
+        const groups = groupFeedbackByAuthor(feedback);
+
+        // No author — roll up by person so the owner can pick whose feedback to
+        // walk through.
+        if (!author) {
+          return {
+            content: [{ type: "text", text: formatFeedbackRollup(feedback) }],
+          };
+        }
+
+        const match = resolveFeedbackAuthor(author, groups);
+        if (!match) {
+          return {
+            content: [
+              {
+                type: "text",
+                text:
+                  `No feedback from anyone matching "${author}". ` +
+                  `People who left feedback: ${[...groups.keys()].join(", ")}.`,
+              },
+            ],
+          };
+        }
+        if ("ambiguous" in match) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `"${author}" matches more than one person: ${match.ambiguous.join(", ")}. Ask which one.`,
+              },
+            ],
+          };
+        }
 
         return {
           content: [
             {
               type: "text",
-              text: `Feedback (${feedback.length} items):\n\n${feedbackList}`,
+              text: formatAuthorQueue(match.author, groups.get(match.author)!),
             },
           ],
         };
@@ -1623,25 +2410,97 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           collectionId: shareCollId,
         });
 
+        // Auto-register a visible prototype version under the project so it
+        // shows up in the dashboard hierarchy (not just "No prototypes yet")
+        let childId: string | null = null;
+        if (shareResult.prototypeId && !shareProtoId) {
+          try {
+            const childResult = await client.registerPrototype({
+              name: shareName,
+              external_url: shareResult.viewUrl,
+              parent_project_id: shareResult.prototypeId,
+              collection_id: shareCollId,
+            });
+            childId = childResult.prototype?.id || null;
+          } catch (err) {
+            console.error("Auto-register child prototype failed (non-blocking):", err);
+          }
+        }
+
         return {
           content: [
             {
               type: "text",
-              text: `Shared!\n\nView URL: ${shareResult.viewUrl}\nPrototype ID: ${shareResult.prototypeId}\n\nVibeSharing: ${VIBESHARING_URL}/dashboard/projects/${shareResult.prototypeId}\n\nThis is a lightweight static share — no Vercel project, no GitHub repo, no build step. The feedback widget is included automatically.${bundledAssets > 0 ? `\n\n${bundledAssets} asset(s) auto-bundled (CSS, SVGs, images inlined into the HTML).` : ""}\n\n${shareResult.shareSummary ? `Share this with your team:\n${shareResult.shareSummary}` : ""}`,
+              text: `Shared!\n\nView URL: ${shareResult.viewUrl}\nPrototype ID: ${childId || shareResult.prototypeId}\n\nVibeSharing: ${VIBESHARING_URL}/dashboard/projects/${shareResult.prototypeId}\n\nThis is a lightweight static share — no hosting project, no GitHub repo, no build step. The feedback widget is included automatically.${bundledAssets > 0 ? `\n\n${bundledAssets} asset(s) auto-bundled (CSS, SVGs, images inlined into the HTML).` : ""}\n\n${shareResult.shareSummary ? `Share this with your team:\n${shareResult.shareSummary}` : ""}`,
             },
           ],
         };
       }
 
       case "deploy_prototype": {
-        const { code, name, prototype_id } = args as {
-          code: string;
+        const {
+          code,
+          files: protoInlineFiles,
+          file_paths: protoFilePaths,
+          name,
+          prototype_id,
+          collection_id: protoCollectionId,
+          parent_project_id: protoParentId,
+          deploy_name: protoDeployName,
+          commit_message: protoCommitMsg,
+          summary: protoSummary,
+          version_label: protoVersionLabel,
+          template: deployTemplate,
+        } = args as {
+          code?: string;
+          files?: Array<{ path: string; content: string }>;
+          file_paths?: Array<{ path: string; deploy_path?: string }>;
           name: string;
           prototype_id?: string;
+          collection_id?: string;
+          parent_project_id?: string;
+          deploy_name?: string;
+          commit_message?: string;
+          summary?: string;
+          version_label?: string;
+          template?: string;
         };
 
-        // Guardrail: if no existing prototype specified, bounce back with options
-        if (!prototype_id) {
+        // Build file list from code, files, or file_paths
+        const deployFiles: Array<{ path: string; content: string }> = [];
+
+        if (protoInlineFiles && protoInlineFiles.length > 0) {
+          deployFiles.push(...protoInlineFiles);
+        }
+
+        if (protoFilePaths && protoFilePaths.length > 0) {
+          for (const fp of protoFilePaths) {
+            try {
+              const content = readFileSync(fp.path, "utf-8");
+              deployFiles.push({ path: fp.deploy_path || basename(fp.path), content });
+            } catch (err) {
+              return {
+                content: [{ type: "text", text: `Error reading file "${fp.path}": ${err instanceof Error ? err.message : "Unknown error"}` }],
+                isError: true,
+              };
+            }
+          }
+        }
+
+        if (deployFiles.length === 0 && code) {
+          deployFiles.push({ path: "app/page.tsx", content: code });
+        }
+
+        if (deployFiles.length === 0) {
+          return {
+            content: [{ type: "text", text: "Error: Provide code, files, or file_paths to deploy." }],
+            isError: true,
+          };
+        }
+
+        // Guardrail: if no existing prototype AND no collection specified, bounce back
+        // Skip if the caller already knows where to put it (collection_id or parent_project_id)
+        if (!prototype_id && !protoCollectionId && !protoParentId) {
           const [guardCollResult, guardProtoResult] = await Promise.all([
             client.listCollections(),
             client.listPrototypes(),
@@ -1681,7 +2540,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             .replace(/[^a-z0-9]+/g, "-")
             .replace(/^-+|-+$/g, "");
           sections.push(
-            `\nSuggested deploy name: "${suggestedSlug}" → https://${suggestedSlug}.vercel.app\n` +
+            `\nSuggested deploy name: "${suggestedSlug}"\n` +
             `Ask the user: Do you want to use this name or choose a different one?`
           );
 
@@ -1698,7 +2557,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         // If no prototype_id, first register a new prototype
         let prototypeId = prototype_id;
         if (!prototypeId) {
-          const registered = await client.registerPrototype({ name });
+          const registered = await client.registerPrototype({
+            name,
+            collection_id: protoCollectionId,
+            parent_project_id: protoParentId,
+          });
           prototypeId = registered.prototype?.id;
         }
 
@@ -1714,19 +2577,69 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           };
         }
 
-        const result = await client.deployPrototype({
-          code,
-          prototypeName: name,
+        // Deploy via git path (GitHub repo + Vercel) so every prototype gets
+        // version history, forkability, and push-to-deploy
+        const result = await client.deployFiles(
           prototypeId,
-        });
+          deployFiles,
+          protoCommitMsg || "Deploy via MCP",
+          protoDeployName,
+          deployTemplate,
+          protoSummary,
+          protoVersionLabel,
+        );
+
+        // Check for existing manual topics to decide whether to prompt for feedback
+        let hasManualTopics = false;
+        try {
+          const existingTopics = await client.listFeedbackTopics(prototypeId);
+          hasManualTopics = (existingTopics.topics || []).some((t: { source: string }) => t.source === "manual");
+        } catch { /* non-blocking */ }
+
+        const feedbackPrompt = buildFeedbackPrompt(prototypeId, hasManualTopics);
+
+        // Surface build status clearly
+        const protoBuildFailed = result.buildError || result.success === false;
+        const protoBuildVerified = result.buildVerified === true;
+
+        let protoStatusLine: string;
+        if (protoBuildFailed) {
+          protoStatusLine = `BUILD FAILED — ${result.buildError || result.error || "Build script returned non-zero exit code"}.\nThe live URL may still be serving a previous version. Fix the build errors and deploy again.`;
+        } else if (protoBuildVerified) {
+          protoStatusLine = `Deployed ${deployFiles.length} file${deployFiles.length === 1 ? "" : "s"} successfully!`;
+        } else {
+          protoStatusLine = `Deployed ${deployFiles.length} file${deployFiles.length === 1 ? "" : "s"} — build in progress. If it fails, the live URL will serve the previous version. Run 'diagnose' to check status.`;
+        }
+
+        // Soft nudge: re-deploys benefit a lot from a one-line version_label.
+        // Without one, the Versions panel just shows v1/v2/v3 and reviewers
+        // can't tell which version is which.
+        const wasReDeploy = !!prototype_id;
+        const labelNudge = wasReDeploy && !protoVersionLabel && !protoBuildFailed
+          ? `\n\n💡 **Tip:** No \`version_label\` was provided. On re-deploys, a short label like \`"dark theme"\` or \`"tightened spacing"\` makes the Versions panel scannable — reviewers can tell v3 apart from v5 without diff'ing files. Ask the user what to call this version next time.`
+          : "";
+
+        // Template nudge: if no template was used and org has templates, suggest it
+        let templateNudge = "";
+        if (!deployTemplate && !protoBuildFailed) {
+          try {
+            const tplResult = await client.listTemplates();
+            const activeTpls = ((tplResult as any).templates || []).filter((t: { is_active: boolean }) => t.is_active);
+            if (activeTpls.length > 0) {
+              const tplNames = activeTpls.map((t: { name: string; slug: string }) => `${t.name} (\`${t.slug}\`)`).join(", ");
+              templateNudge = `\n\n💡 **Design system available:** Your org has ${activeTpls.length} template${activeTpls.length === 1 ? "" : "s"}: ${tplNames}. Next time, ask the user if they'd like to use one of these before coding — it'll make the prototype match your org's brand from the start.`;
+            }
+          } catch { /* non-blocking */ }
+        }
 
         return {
           content: [
             {
               type: "text",
-              text: `Deployed successfully!\n\nLive URL: ${result.deployedUrl}\nVibeSharing: ${VIBESHARING_URL}/dashboard/projects/${prototypeId}\n\nYour team can now view the prototype and leave feedback.${result.contextImported ? "\n\nProject context was automatically imported." : ""}`,
+              text: `${protoStatusLine}\n\n${result.deployName ? `Deploy name: ${result.deployName}\n` : ""}${result.shareUrl ? `Share URL: ${result.shareUrl}\n` : ""}Live URL: ${result.deployUrl || "Deploying..."}\nRepo: ${result.repoUrl || "N/A"}\n\nVibeSharing: ${VIBESHARING_URL}/dashboard/projects/${prototypeId}\n\n${feedbackPrompt}${labelNudge}${templateNudge}${result.repoUrl ? `\n\nLocal sync check: this prototype's canonical repo is ${result.repoUrl}. If the user is working from a local clone, run \`git remote get-url origin\` — if it doesn't match, offer to run \`git remote set-url origin ${result.repoUrl}\` so future pushes deploy. (Common after re-cloning on a second machine.)` : ""}\n\nIMPORTANT: Update CLAUDE.md now with what was built, key decisions, and current state.`,
             },
           ],
+          ...(protoBuildFailed ? { isError: true } : {}),
         };
       }
 
@@ -1752,13 +2665,42 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
 
+      case "create_campaign": {
+        const campaignArgs = args as {
+          name: string;
+          goal?: string;
+          feedback_mode?: "guided" | "open";
+          feedback_layout?: "new_window" | "side_rail";
+          variant_group?: string;
+          randomize_order?: boolean;
+          expires_in_days?: number;
+          questions?: unknown[];
+          prototypes?: Array<{ prototype_id: string; about?: string; questions?: unknown[] }>;
+        };
+
+        const result = await client.createCampaign(campaignArgs);
+        const c = result.campaign;
+        const attached: string[] = result.attached || [];
+        const skipped: string[] = result.skipped || [];
+
+        let text = `Draft research campaign created!\n\nName: ${c.name}\nStatus: ${c.status} (not yet open)\n`;
+        if (attached.length) text += `Prototypes: ${attached.join(", ")}\n`;
+        if (skipped.length) text += `⚠ Skipped (not found in your org): ${skipped.join(", ")}\n`;
+        text += `\nReview & open it (opening applies access gating + invites your reviewers):\n${result.dashboardUrl}\n\nPortal link (after you open it): ${result.portalUrl}`;
+
+        return { content: [{ type: "text", text }] };
+      }
+
       case "deploy_files": {
-        const { prototype_id: deployProtoId, files: inlineFiles, file_paths: filePaths, commit_message, deploy_name: deployName } = args as {
+        const { prototype_id: deployProtoId, files: inlineFiles, file_paths: filePaths, commit_message, summary: filesSummary, version_label: filesVersionLabel, deploy_name: deployName, template: filesTemplate } = args as {
           prototype_id: string;
           files?: Array<{ path: string; content: string }>;
           file_paths?: Array<{ path: string; deploy_path?: string }>;
           commit_message?: string;
+          summary?: string;
+          version_label?: string;
           deploy_name?: string;
+          template?: string;
         };
 
         // Build combined files array from inline files and file paths
@@ -1781,16 +2723,54 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         if (files.length === 0) {
           return {
-            content: [{ type: "text", text: "Error: Either files or file_paths is required." }],
+            content: [{ type: "text" as const, text: "Error: Either files or file_paths is required." }],
             isError: true,
           };
+        }
+
+        // Guardrail: if total payload is large, suggest import_repo instead
+        const totalSize = files.reduce((sum, f) => sum + (f.content?.length || 0), 0);
+        if (totalSize > 100_000) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: `This deploy has ${files.length} files totaling ~${Math.round(totalSize / 1024)}KB — too large for inline deployment.\n\nUse \`import_repo\` instead if the code is in a GitHub repo. It fetches files server-side with no size limits and supports branch selection.\n\nIf the code isn't in a repo yet, commit and push it to GitHub first, then use \`import_repo\`.`,
+            }],
+            isError: true,
+          };
+        }
+
+        // Pre-deploy validation: check if package.json has a framework or build script
+        const pkgFile = files.find(f => f.path === "package.json" || f.path.endsWith("/package.json"));
+        if (pkgFile) {
+          try {
+            const pkgData = JSON.parse(pkgFile.content);
+            const allDeps = { ...pkgData.dependencies, ...pkgData.devDependencies };
+            const knownFrameworks = ["next", "vite", "nuxt", "astro", "gatsby", "react-scripts", "remix", "svelte", "@sveltejs/kit"];
+            const hasFramework = knownFrameworks.some(f => f in allDeps);
+            const hasBuild = !!pkgData.scripts?.build;
+            if (!hasFramework && !hasBuild) {
+              return {
+                content: [{
+                  type: "text",
+                  text: `⚠ Pre-deploy validation failed!\n\nYour package.json has no recognized framework (next, vite, nuxt, astro, gatsby, etc.) and no build script. The build will fail.\n\nFix: Either install a framework (e.g., \`npm install next react react-dom\`) or add a "build" script to package.json, then try deploying again.`,
+                }],
+                isError: true,
+              };
+            }
+          } catch {
+            // If package.json can't be parsed, let it through — the build will catch it
+          }
         }
 
         const deployResult = await client.deployFiles(
           deployProtoId,
           files,
           commit_message || "Deploy via MCP",
-          deployName
+          deployName,
+          filesTemplate,
+          filesSummary,
+          filesVersionLabel
         );
 
         // Feature 1: Auto-sync context if CLAUDE.md or AGENTS.md is present
@@ -1823,17 +2803,58 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           console.error("Feedback topics check failed (non-blocking):", err);
         }
 
+        // Check if manual topics already exist
+        let hasManualTopicsDF = false;
+        try {
+          const existingTopicsDF = await client.listFeedbackTopics(deployProtoId);
+          hasManualTopicsDF = (existingTopicsDF.topics || []).some((t: { source: string }) => t.source === "manual");
+        } catch { /* non-blocking */ }
+
+        const feedbackPromptDF = buildFeedbackPrompt(deployProtoId, hasManualTopicsDF);
+
         const postDeployNotes: string[] = [];
         if (contextSynced) postDeployNotes.push("Context synced from CLAUDE.md.");
-        if (topicsGenerated) postDeployNotes.push("Feedback topics auto-generated for your team.");
+
+        // Surface build status clearly
+        const dfBuildFailed = deployResult.buildError || deployResult.success === false;
+        const dfBuildVerified = deployResult.buildVerified === true;
+
+        let dfStatusLine: string;
+        if (dfBuildFailed) {
+          dfStatusLine = `BUILD FAILED — ${deployResult.buildError || deployResult.error || "Build script returned non-zero exit code"}.\nThe live URL may still be serving a previous version. Fix the build errors and deploy again.`;
+        } else if (dfBuildVerified) {
+          dfStatusLine = `Deployed ${files.length} files successfully!`;
+        } else {
+          dfStatusLine = `Deployed ${files.length} files — build in progress. If it fails, the live URL will serve the previous version. Run 'diagnose' to check status.`;
+        }
+
+        // Soft nudge: deploy_files always re-deploys (prototype_id required),
+        // so a missing version_label is always worth flagging.
+        const dfLabelNudge = !filesVersionLabel && !dfBuildFailed
+          ? `\n\n💡 **Tip:** No \`version_label\` was provided. Re-deploys benefit from a short label like \`"dark theme"\` or \`"tightened spacing"\` so the Versions panel is scannable. Ask the user what to call this version next time.`
+          : "";
+
+        // Template nudge: if no template was used and org has templates, suggest it
+        let dfTemplateNudge = "";
+        if (!filesTemplate && !dfBuildFailed) {
+          try {
+            const tplResult = await client.listTemplates();
+            const activeTpls = ((tplResult as any).templates || []).filter((t: { is_active: boolean }) => t.is_active);
+            if (activeTpls.length > 0) {
+              const tplNames = activeTpls.map((t: { name: string; slug: string }) => `${t.name} (\`${t.slug}\`)`).join(", ");
+              dfTemplateNudge = `\n\n💡 **Design system available:** Your org has ${activeTpls.length} template${activeTpls.length === 1 ? "" : "s"}: ${tplNames}. Next time, ask the user if they'd like to use one of these before coding — it'll make the prototype match your org's brand from the start.`;
+            }
+          } catch { /* non-blocking */ }
+        }
 
         return {
           content: [
             {
               type: "text",
-              text: `Deployed ${files.length} files!\n\n${deployResult.deployName ? `Deploy name: ${deployResult.deployName}\n` : ""}Live URL: ${deployResult.deployUrl || "Deploying..."}\nRepo: ${deployResult.repoUrl || "N/A"}\nCommit: ${deployResult.commitSha || "N/A"}\n\nVibeSharing: ${VIBESHARING_URL}/dashboard/projects/${deployProtoId}\n\nYour team can now view the prototype and leave feedback.${postDeployNotes.length > 0 ? "\n\n" + postDeployNotes.join("\n") : ""}`,
+              text: `${dfStatusLine}\n\n${deployResult.deployName ? `Deploy name: ${deployResult.deployName}\n` : ""}${deployResult.shareUrl ? `Share URL: ${deployResult.shareUrl}\n` : ""}Live URL: ${deployResult.deployUrl || "Deploying..."}\nRepo: ${deployResult.repoUrl || "N/A"}\nCommit: ${deployResult.commitSha || "N/A"}\n\nVibeSharing: ${VIBESHARING_URL}/dashboard/projects/${deployProtoId}${postDeployNotes.length > 0 ? "\n\n" + postDeployNotes.join("\n") : ""}${dfLabelNudge}${dfTemplateNudge}\n\n${feedbackPromptDF}${deployResult.repoUrl ? `\n\nLocal sync check: this prototype's canonical repo is ${deployResult.repoUrl}. If the user is working from a local clone, run \`git remote get-url origin\` — if it doesn't match, offer to run \`git remote set-url origin ${deployResult.repoUrl}\` so future pushes deploy. (Common after re-cloning on a second machine.)` : ""}\n\nIMPORTANT: Update CLAUDE.md now with what was built, key decisions, and current state.`,
             },
           ],
+          ...(dfBuildFailed ? { isError: true } : {}),
         };
       }
 
@@ -1846,6 +2867,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           parent_project_id: importParentId,
           description: importDesc,
           deploy_name: deployName,
+          branch: importBranch,
+          entry_point: importEntryPoint,
+          version_label: importVersionLabel,
         } = args as {
           repo_url: string;
           name?: string;
@@ -1853,7 +2877,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           collection_id?: string;
           parent_project_id?: string;
           description?: string;
+          branch?: string;
           deploy_name?: string;
+          entry_point?: string;
+          version_label?: string;
         };
 
         // Guardrail: if no collection and no existing prototype specified, bounce back with options
@@ -1905,7 +2932,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               .replace(/[^a-z0-9]+/g, "-")
               .replace(/^-+|-+$/g, "");
             sections.push(
-              `\nNo deploy name specified. Suggested: "${suggestedSlug}" → https://${suggestedSlug}.vercel.app\n` +
+              `\nNo deploy name specified. Suggested: "${suggestedSlug}"\n` +
               `Ask the user: Do you want to use "${suggestedSlug}" or choose a different deploy name?`
             );
           }
@@ -1949,7 +2976,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           };
         }
 
-        const importResult = await client.importRepo(protoId, repo_url, deployName);
+        const importResult = await client.importRepo(protoId, repo_url, deployName, importBranch, importEntryPoint, importVersionLabel);
 
         // Feature 1: Context sync is handled server-side for repo imports (importContextFiles)
 
@@ -1969,17 +2996,47 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           console.error("Feedback topics check failed (non-blocking):", err);
         }
 
+        // Check if manual topics already exist
+        let hasManualTopicsIR = false;
+        try {
+          const existingTopicsIR = await client.listFeedbackTopics(protoId);
+          hasManualTopicsIR = (existingTopicsIR.topics || []).some((t: { source: string }) => t.source === "manual");
+        } catch { /* non-blocking */ }
+
+        const feedbackPromptIR = buildFeedbackPrompt(protoId, hasManualTopicsIR);
+
         const importPostNotes: string[] = [];
-        if (importTopicsGenerated) importPostNotes.push("Feedback topics auto-generated for your team.");
         if (importResult.indexNote) importPostNotes.push(`⚠ ${importResult.indexNote}`);
+
+        // Surface build status clearly
+        const buildFailed = importResult.buildStatus === "error" || importResult.success === false;
+        const buildInProgress = importResult.buildStatus === "building";
+
+        let statusLine: string;
+        if (buildFailed) {
+          statusLine = `BUILD FAILED — ${importResult.buildError || importResult.buildWarning || "Build script returned non-zero exit code"}.\nThe live URL may still be serving a previous version. Fix the build errors and re-import.`;
+        } else if (buildInProgress) {
+          statusLine = `Repo imported — build still in progress. If it fails, the live URL will serve the previous version. Run 'diagnose' to check status.`;
+        } else {
+          statusLine = `Repo imported and deployed successfully!`;
+        }
+
+        // Soft nudge: re-imports without a version_label leave the Versions
+        // panel showing v1/v2/v3 with no headline. Only nag when this was a
+        // re-import (existing prototype_id) — first imports get the
+        // prototype's name as their banner anyway.
+        const importLabelNudge = importProtoId && !importVersionLabel && !buildFailed
+          ? `\n\n💡 **Tip:** No \`version_label\` was provided. On re-imports, a short label like \`"fixed nav spacing"\` or \`"merged dashboard branch"\` makes the Versions panel scannable. Ask the user what to call this version next time.`
+          : "";
 
         return {
           content: [
             {
               type: "text",
-              text: `Repo imported and deploying!\n\n${importResult.deployName ? `Deploy name: ${importResult.deployName}\n` : ""}Live URL: ${importResult.deployUrl}\nRepo: ${importResult.repoUrl}\nVibeSharing: ${VIBESHARING_URL}/dashboard/projects/${protoId}\nFiles imported: ${importResult.fileCount || "unknown"}\n\nPushes to the VibeSharing repo will auto-deploy to Vercel.${importPostNotes.length > 0 ? "\n\n" + importPostNotes.join("\n") : ""}`,
+              text: `${statusLine}\n\n${importResult.deployName ? `Deploy name: ${importResult.deployName}\n` : ""}${importResult.shareUrl ? `Share URL: ${importResult.shareUrl}\n` : ""}Live URL: ${importResult.deployUrl}\nRepo: ${importResult.repoUrl}\nVibeSharing: ${VIBESHARING_URL}/dashboard/projects/${protoId}\nFiles imported: ${importResult.fileCount || "unknown"}${importResult.changelog ? `\n\nWhat changed:\n${importResult.changelog}` : ""}${importPostNotes.length > 0 ? "\n\n" + importPostNotes.join("\n") : ""}${importLabelNudge}${importResult.repoUrl ? `\n\nLocal sync check: this prototype's canonical repo is ${importResult.repoUrl} — distinct from whatever GitHub repo was just imported. If the user wants to continue iterating locally, they should clone the canonical repo (not the original), so pushes deploy. Run \`git remote get-url origin\` to check, then \`git remote set-url origin ${importResult.repoUrl}\` if needed.` : ""}\n\n${feedbackPromptIR}`,
             },
           ],
+          ...(buildFailed ? { isError: true } : {}),
         };
       }
 
@@ -2120,14 +3177,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             .replace(/-{2,}/g, "-")
             .replace(/^-+|-+$/g, "");
           sections.push(
-            `DEPLOY NAME: "${slug}" → will deploy to https://${slug}.vercel.app\n` +
+            `DEPLOY NAME: "${slug}"\n` +
             `(Availability will be checked at deploy time. If taken, a suffix will be added.)\n\n` +
             `Ask the user: Do you want to name this deployment "${slug}"?`
           );
         } else {
           sections.push(
             `DEPLOY NAME: Not specified.\n` +
-            `Ask the user: Do you want a custom deploy name (e.g., "erg-v3-teams" → erg-v3-teams.vercel.app), or auto-generate one?`
+            `Ask the user: Do you want a custom deploy name (e.g., "erg-v3-teams"), or auto-generate one?`
           );
         }
 
@@ -2139,6 +3196,226 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             },
           ],
         };
+      }
+
+      // ---- list_templates ----
+      case "list_templates": {
+        const { active_only = true } = args as { active_only?: boolean };
+        const result = await client.listTemplates();
+        const templates = ((result as any).templates || []).filter(
+          (t: { is_active: boolean }) => !active_only || t.is_active
+        );
+
+        if (templates.length === 0) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: "No templates found for your organization.\n\nTemplates define your design system — CSS variables, typography, spacing, and AI instructions that are injected at deploy time.\n\nCreate templates at: vibesharing.app/dashboard/settings/templates",
+            }],
+          };
+        }
+
+        const lines = templates.map((t: { name: string; slug: string; description: string | null; is_active: boolean; theme_css: string; design_instructions: string | null; preview_url: string | null }) => {
+          const varCount = (t.theme_css.match(/--[\w-]+:/g) || []).length;
+          const hasInstructions = !!t.design_instructions && t.design_instructions.length > 50;
+          const hasPreview = !!t.preview_url;
+          return `**${t.name}** (slug: \`${t.slug}\`)${!t.is_active ? " [INACTIVE]" : ""}\n  ${t.description || "No description"}\n  ${varCount} CSS variables${hasInstructions ? " + design instructions" : ""}${hasPreview ? " + reference screenshot" : ""}`;
+        });
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: `## Design System Templates (${templates.length})\n\n${lines.join("\n\n")}\n\n---\n**Want to use one?** Ask the user which template they'd like, then call \`get_template\` with the slug to pull the full CSS variables and design instructions into your project. This ensures every component matches the org's design system from the start.`,
+          }],
+        };
+      }
+
+      // ---- get_template ----
+      case "get_template": {
+        const { template: templateIdOrSlug } = args as { template: string };
+
+        try {
+          const result = await client.getTemplate(templateIdOrSlug);
+          const t = (result as any).template;
+
+          if (!t) {
+            return {
+              content: [{
+                type: "text" as const,
+                text: `Template "${templateIdOrSlug}" not found. Use \`list_templates\` to see available templates.`,
+              }],
+              isError: true,
+            };
+          }
+
+          // Use merged fields if this is a variant with a parent, otherwise raw fields
+          const css = t.merged_theme_css || t.theme_css;
+          const instructions = t.merged_design_instructions || t.design_instructions;
+          const starter = t.merged_starter_page || t.starter_page;
+
+          const varCount = (css.match(/--[\w-]+:/g) || []).length;
+
+          let text = `## Template: ${t.name}\n\n`;
+          text += `**Slug:** \`${t.slug}\`\n`;
+          text += `**Status:** ${t.is_active ? "Active" : "Inactive"}\n`;
+          text += `**CSS Variables:** ${varCount}\n`;
+          if (t.parent_template_id) {
+            text += `**Extends:** base template (structural tokens inherited)\n`;
+          }
+          text += `\n`;
+
+          if (t.description) {
+            text += `${t.description}\n\n`;
+          }
+
+          text += `### CSS Variables\n\n\`\`\`css\n${css}\n\`\`\`\n\n`;
+
+          if (instructions) {
+            text += `### Design Instructions\n\n${instructions}\n\n`;
+          }
+
+          if (starter) {
+            text += `### Starter Page\n\n\`\`\`tsx\n${starter}\n\`\`\`\n\n`;
+          }
+
+          if (t.preview_url) {
+            text += `### Reference Screenshot\n\nA reference screenshot is attached below. Use it as a visual target — the prototype should match this layout, spacing, and visual hierarchy.\n\n`;
+          }
+
+          text += `---\n## How to use this template\n\n`;
+          text += `1. **Write the CSS variables** into your project's \`globals.css\` (or equivalent) under \`:root { }\` so every component picks them up automatically.\n`;
+          text += `2. **Write the design instructions** into your project's \`CLAUDE.md\` so they persist across sessions and every future edit stays on-brand.\n`;
+          text += `3. **Use the CSS variables** (e.g., \`var(--color-primary)\`) in all components instead of hardcoded colors/fonts.\n`;
+          text += `4. **When ready to deploy**, pass \`template: "${t.slug}"\` to \`deploy_files\` or \`deploy_prototype\` — this re-applies the template server-side to catch any drift.\n`;
+
+          const contentBlocks: Array<{ type: string; text?: string; data?: string; mimeType?: string }> = [
+            { type: "text", text },
+          ];
+
+          // Fetch and attach preview image if available
+          if (t.preview_url) {
+            try {
+              const imgRes = await fetch(t.preview_url, { signal: AbortSignal.timeout(5000) });
+              if (imgRes.ok) {
+                const imgBuffer = await imgRes.arrayBuffer();
+                const base64 = Buffer.from(imgBuffer).toString("base64");
+                const mimeType = imgRes.headers.get("content-type") || "image/png";
+                contentBlocks.push({ type: "image", data: base64, mimeType });
+              }
+            } catch {
+              // Non-blocking — skip image if fetch fails
+            }
+          }
+
+          return { content: contentBlocks } as { content: { type: string; text: string }[]; isError?: boolean };
+        } catch (error: any) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: `Error retrieving template: ${error.message}`,
+            }],
+            isError: true,
+          };
+        }
+      }
+
+      // ---- quick_prototype ----
+      case "quick_prototype": {
+        const {
+          description: protoDescription,
+          template: templateSlug,
+          name: protoName,
+          collection_id,
+          parent_project_id,
+        } = args as {
+          description: string;
+          template?: string;
+          name?: string;
+          collection_id?: string;
+          parent_project_id?: string;
+        };
+
+        if (!protoDescription) {
+          return { content: [{ type: "text" as const, text: "Please provide a description of what the prototype should show." }], isError: true };
+        }
+
+        const templatesResult = await client.listTemplates();
+        const activeTemplates = ((templatesResult as any).templates || []).filter(
+          (t: { is_active: boolean }) => t.is_active
+        );
+
+        if (activeTemplates.length === 0) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: "No active templates found for your org. quick_prototype requires at least one template.\n\nCreate templates at: vibesharing.app/dashboard/settings/templates\nOr use `deploy_prototype` or `deploy_files` for unthemed deploys.",
+            }],
+            isError: true,
+          };
+        }
+
+        let selectedTemplate = activeTemplates[0];
+        if (templateSlug) {
+          const match = activeTemplates.find((t: { slug: string }) => t.slug === templateSlug);
+          if (!match) {
+            const available = activeTemplates.map((t: { name: string; slug: string }) => `  - ${t.name} (slug: \`${t.slug}\`)`).join("\n");
+            return {
+              content: [{
+                type: "text" as const,
+                text: `Template "${templateSlug}" not found. Available templates:\n${available}`,
+              }],
+              isError: true,
+            };
+          }
+          selectedTemplate = match;
+        }
+
+        const autoName = protoName || protoDescription.slice(0, 50).replace(/[^a-zA-Z0-9\s-]/g, "").trim();
+        const templateData = selectedTemplate as {
+          name: string;
+          slug: string;
+          theme_css: string;
+          starter_page: string | null;
+          design_instructions: string | null;
+        };
+
+        const instructions = [
+          `## Quick Prototype: "${autoName}"`,
+          `**Template:** ${templateData.name} (${templateData.slug})`,
+          `**Description:** ${protoDescription}`,
+          ``,
+          `### Next steps — generate the code and deploy`,
+          ``,
+          `1. **Register the prototype** using \`register_prototype\` with name: "${autoName}"${collection_id ? `, collection_id: "${collection_id}"` : ""}${parent_project_id ? `, parent_project_id: "${parent_project_id}"` : ""}`,
+          `2. **Generate the code** — create a Next.js page that matches the description above. Use ONLY these CSS variables for colors and styling (never hardcode hex values):`,
+          ``,
+          `\`\`\`css`,
+          templateData.theme_css,
+          `\`\`\``,
+          ``,
+          `   Reference variables in Tailwind like: \`bg-[var(--bg-base)]\`, \`text-[var(--text-primary)]\`, \`border-[var(--border-default)]\``,
+        ];
+
+        if (templateData.design_instructions) {
+          instructions.push(``, `3. **Follow these design instructions** from the template:`, ``, templateData.design_instructions);
+        }
+
+        if (templateData.starter_page) {
+          instructions.push(``, `4. **Starter page available** — the template includes a starter page.tsx. You can use it as a base or generate from scratch using the design system.`);
+        }
+
+        instructions.push(
+          ``,
+          `5. **Deploy** using \`deploy_files\` with the prototype ID from step 1. Include:`,
+          `   - \`app/globals.css\` — the template CSS above (use verbatim)`,
+          `   - \`app/page.tsx\` — your generated page`,
+          `   - Any additional component files`,
+          `   - Set template: "${templateData.slug}" to apply template overrides at deploy time`,
+          ``,
+          `6. **Share the live URL** with the user when done.`,
+        );
+
+        return { content: [{ type: "text" as const, text: instructions.join("\n") }] };
       }
 
       case "add_context_link": {
@@ -2251,11 +3528,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "generate_feedback_topics": {
-        const { project_id, topics, brief, focus } = args as {
+        const { project_id, topics, brief, focus, scope_note } = args as {
           project_id: string;
           topics?: Array<{ title: string; description?: string; theme?: string }>;
           brief?: string;
           focus?: string;
+          scope_note?: string;
         };
 
         const feedbackFocus = focus || "full";
@@ -2278,7 +3556,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         // Store brief and focus
         try {
-          await client.updateFeedbackBrief(project_id, brief || "", feedbackFocus);
+          await client.updateFeedbackBrief(project_id, brief || "", feedbackFocus, scope_note);
         } catch (err) {
           console.error("Failed to store feedback brief/focus:", err);
         }
@@ -2414,6 +3692,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           lines.push(`\u2713 Prototypes: ${total} total, all have deploy URLs`);
         }
 
+        // Hosting credits
+        if (result.hosting) {
+          const h = result.hosting as { provider: string; team?: string; plan?: string; credits?: { used: number; included: number; remaining: number }; error?: string };
+          if (h.error) {
+            lines.push(`\u26A0 Hosting (${h.provider}): ${h.error}`);
+          } else if (h.credits) {
+            const pct = Math.round((h.credits.used / h.credits.included) * 100);
+            const icon = pct >= 80 ? "\u26A0" : "\u2713";
+            lines.push(`${icon} Hosting (${h.provider}): ${h.credits.remaining}/${h.credits.included} credits remaining (${pct}% used) — ${h.team} (${h.plan})`);
+          }
+        }
+
         // Issues summary
         const issues: string[] = [];
         if (!result.token?.valid) issues.push("Token is invalid. Get a new one from Account Settings.");
@@ -2422,6 +3712,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           issues.push(`${result.deploy_locks.cleared} stuck deploy lock(s) were cleared. Retry your deploy.`);
         }
         if (failed > 0) issues.push(`${failed} deploy error(s) in the last 24h. Check the errors above.`);
+        if (result.hosting?.credits?.remaining <= 50) {
+          issues.push(`Low hosting credits: ${result.hosting.credits.remaining} remaining. Consider upgrading your Netlify plan.`);
+        }
 
         if (issues.length > 0) {
           lines.push("", "Issues found:");
@@ -2430,6 +3723,193 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }
         } else {
           lines.push("", "No issues found. Everything looks good!");
+        }
+
+        return {
+          content: [{ type: "text", text: lines.join("\n") }],
+        };
+      }
+
+      case "validate_project": {
+        const { project_path } = args as { project_path?: string };
+        const projectDir = project_path || process.cwd();
+        const issues: Array<{ level: "error" | "warning" | "ok"; message: string; fix?: string }> = [];
+
+        // Check for package.json
+        let pkg: { dependencies?: Record<string, string>; devDependencies?: Record<string, string>; scripts?: Record<string, string> } | null = null;
+        try {
+          const pkgContent = readFileSync(join(projectDir, "package.json"), "utf-8");
+          pkg = JSON.parse(pkgContent);
+        } catch {
+          // No package.json — could be a static HTML project
+        }
+
+        if (!pkg) {
+          // Check if there's at least an index.html for static deployment
+          try {
+            readFileSync(join(projectDir, "index.html"), "utf-8");
+            issues.push({ level: "ok", message: "Static HTML project detected (no package.json). Will deploy as a static site." });
+          } catch {
+            issues.push({ level: "warning", message: "No package.json or index.html found. The hosting provider may not know how to deploy this project.", fix: "Add an index.html for static hosting, or run `npm init` and install a framework." });
+          }
+        } else {
+          const allDeps = { ...pkg.dependencies, ...pkg.devDependencies };
+          const frameworks = ["next", "vite", "nuxt", "astro", "gatsby", "react-scripts", "remix", "svelte", "@sveltejs/kit"];
+          const detectedFrameworks = frameworks.filter(f => f in allDeps);
+
+          if (detectedFrameworks.length === 0 && !pkg.scripts?.build) {
+            issues.push({
+              level: "error",
+              message: "package.json has no recognized framework and no build script. Build will fail.",
+              fix: "Install a framework (e.g., `npm install next react react-dom`) or add a \"build\" script to package.json.",
+            });
+          } else if (detectedFrameworks.length === 0 && pkg.scripts?.build) {
+            issues.push({ level: "ok", message: `Custom build script found: "${pkg.scripts.build}". No standard framework detected, but the hosting provider should use your build script.` });
+          } else {
+            issues.push({ level: "ok", message: `Framework detected: ${detectedFrameworks.join(", ")}` });
+          }
+
+          // Check for Next.js-specific issues
+          if ("next" in allDeps) {
+            if (!pkg.scripts?.build) {
+              issues.push({ level: "warning", message: "Next.js detected but no build script found.", fix: "Add `\"build\": \"next build\"` to your package.json scripts." });
+            }
+            // Check for next.config
+            let hasNextConfig = false;
+            for (const configName of ["next.config.js", "next.config.mjs", "next.config.ts"]) {
+              try { readFileSync(join(projectDir, configName), "utf-8"); hasNextConfig = true; break; } catch {}
+            }
+            if (!hasNextConfig) {
+              issues.push({ level: "warning", message: "No next.config file found. This is usually fine but may be needed for custom settings." });
+            }
+          }
+
+          // Check for lock file
+          let hasLockFile = false;
+          for (const lockFile of ["package-lock.json", "yarn.lock", "pnpm-lock.yaml", "bun.lockb"]) {
+            try { readFileSync(join(projectDir, lockFile), "utf-8"); hasLockFile = true; break; } catch {}
+          }
+          if (!hasLockFile) {
+            issues.push({ level: "warning", message: "No lock file found (package-lock.json, yarn.lock, etc.).", fix: "Run `npm install` to generate a lock file. Vercel builds may be inconsistent without one." });
+          }
+
+          // Check package-lock.json for entries pinned to non-registry URLs.
+          // Mutable URLs (no version in path, served from a custom CDN) break
+          // builds the moment the upstream tarball is republished, because the
+          // lockfile's integrity hash no longer matches what's served.
+          // Known landmine: @diligentcorp/atlas-react-bundle on atlas.diligent.com.
+          const REGISTRY_HOST_SUFFIXES = [
+            "registry.npmjs.org",
+            "registry.npmjs.com",
+            "registry.yarnpkg.com",
+            "npm.pkg.github.com",
+            ".pkgs.visualstudio.com",
+            ".codeartifact.amazonaws.com",
+            ".jfrog.io",
+            ".cloudsmith.io",
+            ".gitlab.com",
+          ];
+          const isRegistryUrl = (url: string) => {
+            try {
+              const host = new URL(url).hostname;
+              return REGISTRY_HOST_SUFFIXES.some(s =>
+                s.startsWith(".") ? host.endsWith(s) : host === s
+              );
+            } catch {
+              return false;
+            }
+          };
+          try {
+            const lockText = readFileSync(join(projectDir, "package-lock.json"), "utf-8");
+            const lock = JSON.parse(lockText) as {
+              packages?: Record<string, { resolved?: string; integrity?: string }>;
+            };
+            const suspect: Array<{ pkg: string; url: string }> = [];
+            for (const [path, entry] of Object.entries(lock.packages || {})) {
+              if (!entry.resolved || !entry.integrity) continue;
+              if (entry.resolved.startsWith("git+")) continue; // git refs are tagged
+              if (isRegistryUrl(entry.resolved)) continue;
+              const pkgName = path.replace(/^.*node_modules\//, "") || path;
+              suspect.push({ pkg: pkgName, url: entry.resolved });
+            }
+            if (suspect.length > 0) {
+              const list = suspect
+                .slice(0, 3)
+                .map(s => `${s.pkg} → ${new URL(s.url).host}`)
+                .join(", ");
+              const more = suspect.length > 3 ? ` (+${suspect.length - 3} more)` : "";
+              issues.push({
+                level: "warning",
+                message: `package-lock.json pins ${suspect.length} dependency to a non-registry URL: ${list}${more}. If the upstream tarball is republished without a version bump, npm install will fail with an integrity-check error and your deploy will break.`,
+                fix: "Ask the package maintainer to publish to an npm registry, or to use immutable per-version URLs. As a workaround, deploy this prototype without a lockfile so npm always installs the latest tarball.",
+              });
+              // Track for platform-wide visibility
+              client.trackEvent("validate_project_lockfile_mutable_url", {
+                count: suspect.length,
+                packages: suspect.slice(0, 5).map(s => s.pkg),
+                hosts: [...new Set(suspect.map(s => { try { return new URL(s.url).host; } catch { return "unknown"; } }))],
+              }).catch(() => {});
+            }
+          } catch {
+            // No package-lock.json or parse error — already covered by the hasLockFile check
+          }
+
+          // Check for scripts that reach above the repo root. Common when a
+          // project is extracted from a monorepo subfolder without updating
+          // relative paths — `../foo` resolved when the package lived inside
+          // its parent repo but doesn't exist once the folder is the build
+          // root. npm runs the script during install and exits non-zero
+          // before the build can even start.
+          if (pkg.scripts) {
+            const escapingScripts: Array<{ name: string; command: string }> = [];
+            for (const [name, command] of Object.entries(pkg.scripts)) {
+              if (typeof command !== "string") continue;
+              if (/(^|\s)\.\.\//.test(command)) {
+                escapingScripts.push({ name, command });
+              }
+            }
+            if (escapingScripts.length > 0) {
+              const list = escapingScripts
+                .slice(0, 3)
+                .map(s => `"${s.name}": ${s.command}`)
+                .join("; ");
+              const more = escapingScripts.length > 3 ? ` (+${escapingScripts.length - 3} more)` : "";
+              issues.push({
+                level: "error",
+                message: `package.json scripts reference paths outside the repo root: ${list}${more}. These will fail at install/build time because the parent directory doesn't exist on the build host.`,
+                fix: "Update the path to be relative to the repo root (e.g., `../scripts/foo.mjs` → `./scripts/foo.mjs`) or move the referenced file into the repo.",
+              });
+              client.trackEvent("validate_project_script_escapes_root", {
+                count: escapingScripts.length,
+                scripts: escapingScripts.slice(0, 5).map(s => s.name),
+              }).catch(() => {});
+            }
+          }
+        }
+
+        // Format output
+        const errors = issues.filter(i => i.level === "error");
+        const warnings = issues.filter(i => i.level === "warning");
+        const oks = issues.filter(i => i.level === "ok");
+
+        const lines: string[] = [`Project Validation: ${projectDir}`, "=".repeat(40)];
+
+        for (const ok of oks) lines.push(`✓ ${ok.message}`);
+        for (const w of warnings) {
+          lines.push(`⚠ ${w.message}`);
+          if (w.fix) lines.push(`  Fix: ${w.fix}`);
+        }
+        for (const e of errors) {
+          lines.push(`✗ ${e.message}`);
+          if (e.fix) lines.push(`  Fix: ${e.fix}`);
+        }
+
+        if (errors.length > 0) {
+          lines.push("", `${errors.length} error(s) found. Deployment will likely fail.`);
+        } else if (warnings.length > 0) {
+          lines.push("", `No errors, but ${warnings.length} warning(s). Deployment should work but review the warnings.`);
+        } else {
+          lines.push("", "All checks passed. Ready to deploy!");
         }
 
         return {
@@ -2462,6 +3942,153 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 : `Support request logged but email delivery had an issue.\n\nSubject: ${subject}\n\n${result.message}`,
             },
           ],
+        };
+      }
+
+      case "list_versions": {
+        const { prototype_id: versionsProtoId, limit: versionsLimit } = args as {
+          prototype_id: string;
+          limit?: number;
+        };
+
+        const versionsResult = await client.listVersions(versionsProtoId, versionsLimit);
+        const versions = versionsResult.versions || [];
+
+        if (versions.length === 0) {
+          return {
+            content: [{ type: "text", text: "No version history found for this prototype. Version tracking starts on the next deploy." }],
+          };
+        }
+
+        const lines = versions.map((v: {
+          version_number: number;
+          file_count: number;
+          commit_sha: string | null;
+          commit_message: string | null;
+          deploy_url: string | null;
+          deploy_method: string | null;
+          deployed_by: string | null;
+          can_rollback: boolean;
+          created_at: string;
+          files: Array<{ path: string; size: number }>;
+        }) => {
+          const sha = v.commit_sha ? v.commit_sha.slice(0, 7) : "—";
+          const msg = v.commit_message || "No message";
+          const who = v.deployed_by || "Unknown";
+          const when = new Date(v.created_at).toLocaleString();
+          const rollback = v.can_rollback ? "✓" : "✗";
+          const topFiles = v.files.slice(0, 5).map((f: { path: string }) => f.path).join(", ");
+          const moreFiles = v.files.length > 5 ? ` (+${v.files.length - 5} more)` : "";
+
+          return `**v${v.version_number}** — ${when}\n  ${v.deploy_method || "unknown"} by ${who} | ${v.file_count} files | commit: ${sha}\n  ${msg}\n  Files: ${topFiles}${moreFiles}\n  Rollback: ${rollback}${v.deploy_url ? ` | URL: ${v.deploy_url}` : ""}`;
+        });
+
+        return {
+          content: [{ type: "text", text: `Version history (${versions.length} versions):\n\n${lines.join("\n\n")}` }],
+        };
+      }
+
+      case "rollback_deploy": {
+        const { prototype_id: rollbackProtoId, version_number: rollbackVersion } = args as {
+          prototype_id: string;
+          version_number: number;
+        };
+
+        if (!rollbackVersion || typeof rollbackVersion !== "number") {
+          return {
+            content: [{ type: "text", text: "Error: version_number is required. Use list_versions to find available versions." }],
+            isError: true,
+          };
+        }
+
+        const rollbackResult = await client.rollback(rollbackProtoId, rollbackVersion);
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: `${rollbackResult.message}\n\n${rollbackResult.deploy_url ? `URL: ${rollbackResult.deploy_url}` : ""}${rollbackResult.commit_sha ? `\nCommit: ${rollbackResult.commit_sha}` : ""}`,
+            },
+          ],
+        };
+      }
+
+      case "fork_prototype": {
+        const {
+          prototype_id: forkSourceId,
+          name: forkName,
+          deploy_name: forkDeployName,
+          collection_id: forkCollectionId,
+        } = args as {
+          prototype_id: string;
+          name?: string;
+          deploy_name?: string;
+          collection_id?: string;
+        };
+
+        const forkResult = await client.forkPrototype(forkSourceId, {
+          name: forkName,
+          deploy_name: forkDeployName,
+          collection_id: forkCollectionId,
+        });
+
+        const fork = forkResult.fork;
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: `${forkResult.message}\n\nFork: ${fork.name}\nID: ${fork.id}\nParent: ${fork.parent_name} (${fork.parent_id})\nFiles: ${fork.file_count}\n${fork.deploy_url ? `Live URL: ${fork.deploy_url}\n` : "Deploying...\n"}Dashboard: ${fork.dashboard_url}\n\nThe original prototype is untouched. Deploy changes to the fork using its ID.`,
+            },
+          ],
+        };
+      }
+
+      case "delete_prototype": {
+        const { prototype_id: deleteProtoId } = args as { prototype_id: string };
+
+        const deleteResult = await client.deletePrototype(deleteProtoId);
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Deleted "${deleteResult.name}" (${deleteResult.deleted}).`,
+            },
+          ],
+        };
+      }
+
+      case "update_prototype": {
+        const {
+          prototype_id: updateProtoId,
+          name: updateName,
+          description: updateDesc,
+          external_url: updateUrl,
+        } = args as {
+          prototype_id: string;
+          name?: string;
+          description?: string;
+          external_url?: string;
+        };
+
+        const updates: Record<string, string> = {};
+        if (updateName) updates.name = updateName;
+        if (updateDesc !== undefined) updates.description = updateDesc;
+        if (updateUrl !== undefined) updates.external_url = updateUrl;
+
+        if (Object.keys(updates).length === 0) {
+          return {
+            content: [{ type: "text", text: "Error: Provide at least one field to update (name, description, or external_url)." }],
+            isError: true,
+          };
+        }
+
+        await client.updatePrototype(updateProtoId, updates);
+
+        const changedFields = Object.keys(updates).join(", ");
+        return {
+          content: [{ type: "text", text: `Updated ${changedFields} for prototype ${updateProtoId}.` }],
         };
       }
 
@@ -2500,6 +4127,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   if (updateNotice && !toolResult.isError) {
     toolResult.content.unshift({ type: "text", text: updateNotice + "\n\n---\n" });
     updateNotice = null; // Only show once per session
+  }
+
+  // Prepend welcome message on the first successful tool call
+  if (pendingWelcome && !toolResult.isError) {
+    const welcome = await pendingWelcome;
+    pendingWelcome = null as any; // Only show once per session
+    if (welcome) {
+      toolResult.content.unshift({ type: "text", text: welcome + "\n\n---\n" });
+    }
   }
 
   // Prepend unread feedback summary on the first successful tool call

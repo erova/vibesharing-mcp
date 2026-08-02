@@ -1,0 +1,29 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.erova/vibesharing",
+  "description": "Deploy prototypes and collect team feedback from Claude Code, Cursor, or any MCP client.",
+  "repository": {
+    "url": "https://github.com/erova/vibesharing-mcp",
+    "source": "github"
+  },
+  "version": "0.14.1",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "@vibesharingapp/mcp-server",
+      "version": "0.14.1",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "description": "Your VibeSharing deploy token (get it from vibesharing.app/dashboard/account)",
+          "isRequired": true,
+          "format": "string",
+          "isSecret": true,
+          "name": "VIBESHARING_TOKEN"
+        }
+      ]
+    }
+  ]
+}

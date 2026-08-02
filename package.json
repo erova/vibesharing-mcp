@@ -1,6 +1,6 @@
 {
   "name": "@vibesharingapp/mcp-server",
-  "version": "0.9.3",
+  "version": "0.14.1",
   "description": "MCP server for VibeSharing - register prototypes and get feedback directly from Claude Code",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -10,12 +10,14 @@
   "files": [
     "dist",
     "README.md",
-    "glama.json"
+    "glama.json",
+    "LICENSE"
   ],
   "scripts": {
     "build": "tsc && chmod +x dist/index.js",
     "dev": "tsc --watch",
     "start": "node dist/index.js",
+    "test": "node --test tests/smoke.test.mjs",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
