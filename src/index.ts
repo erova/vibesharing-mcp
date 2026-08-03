@@ -642,6 +642,127 @@ When every item is decided and the changes are deployed, call
 close_feedback_loop with a note per item you built. That marks them resolved and
 emails each stakeholder what changed.`.trim();
 
+// ---------------------------------------------------------------------------
+// Feedback screenshots as real images
+//
+// KEEP IN SYNC with the same block in the other copy of this formatter.
+//
+// A pinned comment is captured with a screenshot of exactly what the reviewer
+// was looking at. Returning that as a URL made it useless in practice: reading
+// feedback in an editor meant leaving the editor to open a link, which nobody
+// does mid-review. Sent as an image block the assistant can actually see it,
+// which is the difference between "this feels cluttered" being a sentence and
+// being something you can act on.
+//
+// Only attached to the single-author queue, never the roll-up. The roll-up is a
+// "whose feedback do you want to read" summary and could span dozens of items.
+// ---------------------------------------------------------------------------
+
+/** Screenshots attached to one queue. Past this, the rest are left as links. */
+const SCREENSHOT_MAX_COUNT = 6;
+
+/** Total decoded image budget. Well under typical context limits. */
+const SCREENSHOT_MAX_BYTES = 3 * 1024 * 1024;
+
+const SCREENSHOT_FETCH_TIMEOUT_MS = 5000;
+
+type ContentBlock =
+  | { type: "text"; text: string }
+  | { type: "image"; data: string; mimeType: string };
+
+/**
+ * Fetch the screenshots for a queue and return them as labelled image blocks.
+ *
+ * Each image is preceded by a text label naming the item it belongs to —
+ * without that, several images in a row are unattributable and the assistant
+ * cannot tell which comment it is looking at.
+ *
+ * Never throws. A screenshot is an enhancement to the review, so a broken
+ * fetch degrades to the URL already present in the item's text rather than
+ * failing the whole call. Failures are logged, not swallowed: a screenshot
+ * host quietly 404ing for everyone is exactly the kind of thing that otherwise
+ * goes unnoticed for months.
+ */
+async function buildScreenshotBlocks(
+  items: FeedbackItem[]
+): Promise<ContentBlock[]> {
+  const withShots = items
+    .map((f, i) => ({ f, position: i + 1 }))
+    .filter((e) => !!e.f.screenshot_url);
+
+  if (withShots.length === 0) return [];
+
+  const blocks: ContentBlock[] = [];
+  const selected = withShots.slice(0, SCREENSHOT_MAX_COUNT);
+  let bytesUsed = 0;
+  let attached = 0;
+  let failed = 0;
+
+  for (const { f, position } of selected) {
+    if (bytesUsed >= SCREENSHOT_MAX_BYTES) break;
+
+    let res: Response;
+    try {
+      res = await fetch(f.screenshot_url as string, {
+        signal: AbortSignal.timeout(SCREENSHOT_FETCH_TIMEOUT_MS),
+      });
+    } catch (err) {
+      failed++;
+      console.error(
+        `[get_feedback] Screenshot fetch failed for feedback ${f.id}: ` +
+          `${err instanceof Error ? err.message : String(err)}`
+      );
+      continue;
+    }
+
+    // An `await fetch` in a try/catch does NOT throw on 4xx/5xx — the status
+    // has to be checked explicitly or a 500 reads as success.
+    if (!res.ok) {
+      failed++;
+      console.error(
+        `[get_feedback] Screenshot for feedback ${f.id} returned HTTP ${res.status}.`
+      );
+      continue;
+    }
+
+    const buf = Buffer.from(await res.arrayBuffer());
+    if (bytesUsed + buf.byteLength > SCREENSHOT_MAX_BYTES) break;
+    bytesUsed += buf.byteLength;
+    attached++;
+
+    const excerpt = (f.content || "").replace(/\s+/g, " ").trim().slice(0, 60);
+    blocks.push({
+      type: "text",
+      text: `Screenshot for item ${position} of ${items.length}${excerpt ? ` — "${excerpt}${excerpt.length === 60 ? "…" : ""}"` : ""}:`,
+    });
+    blocks.push({
+      type: "image",
+      data: buf.toString("base64"),
+      mimeType: res.headers.get("content-type") || "image/png",
+    });
+  }
+
+  // Say what was left out. Silently attaching 6 of 14 reads as "there were 6".
+  const notes: string[] = [];
+  const remaining = withShots.length - attached - failed;
+  if (remaining > 0) {
+    notes.push(
+      `${remaining} more item${remaining === 1 ? " has a screenshot" : "s have screenshots"} that ` +
+        `${remaining === 1 ? "was" : "were"} not attached (limit ${SCREENSHOT_MAX_COUNT} per review). ` +
+        `Open the Screenshot links above to see ${remaining === 1 ? "it" : "them"}.`
+    );
+  }
+  if (failed > 0) {
+    notes.push(
+      `${failed} screenshot${failed === 1 ? "" : "s"} could not be loaded; ` +
+        `the link${failed === 1 ? " is" : "s are"} still listed above.`
+    );
+  }
+  if (notes.length) blocks.push({ type: "text", text: notes.join(" ") });
+
+  return blocks;
+}
+
 function formatAuthorQueue(author: string, items: FeedbackItem[]): string {
   const open = items.filter(isOpenFeedback).length;
   const briefs = items.map((f, i) => formatFeedbackBrief(f, i + 1, items.length));
@@ -1852,10 +1973,17 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 });
 
 // Handle tool calls
+type LocalToolResult = {
+  content: Array<{ type: string; text?: string; data?: string; mimeType?: string }>;
+  isError?: boolean;
+};
+
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
 
-  const toolResult = await (async () => {
+  // Explicit annotation: get_feedback contributes image blocks, so the inferred
+  // union would otherwise lose `isError` and drop `data`/`mimeType`.
+  const toolResult: LocalToolResult = await (async (): Promise<LocalToolResult> => {
   try {
     switch (name) {
       case "register_prototype": {
@@ -2106,12 +2234,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           };
         }
 
+        const queueItems = groups.get(match.author)!;
         return {
           content: [
             {
               type: "text",
-              text: formatAuthorQueue(match.author, groups.get(match.author)!),
+              text: formatAuthorQueue(match.author, queueItems),
             },
+            ...(await buildScreenshotBlocks(queueItems)),
           ],
         };
       }

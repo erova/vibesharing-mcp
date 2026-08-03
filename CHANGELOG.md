@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.15.0 — 2026-08-03
+
+### Feedback screenshots you can actually see
+
+Every pinned comment is captured with a screenshot of what the reviewer was looking at. `get_feedback` returned it as a URL, which meant leaving the editor mid-review to open a link — so in practice nobody looked.
+
+**What changed:**
+- **Screenshots arrive as images.** Reviewing one person's feedback now attaches each screenshot as an image block the assistant can see, alongside the comment it belongs to. "This feels cluttered" stops being a sentence and becomes something you can act on.
+- **Labelled per item.** Each image is preceded by which item it belongs to and an excerpt of the comment, so several in a row are never ambiguous.
+- **Bounded.** At most 6 screenshots and 3MB per review, and anything left out is named rather than silently dropped — attaching 6 of 14 shouldn't read as "there were 6".
+- **Only on the per-person queue.** The roll-up (`get_feedback` with no `author`) stays text; it's a "whose feedback do you want to read" summary and could span dozens of items.
+- **A screenshot host returning 404 no longer reads as success.** The status is checked explicitly and failures are logged, with the link still listed so nothing is lost.
+
+Works on both the local server and the remote endpoint at `vibesharing.app/api/mcp`.
+
 ## 0.14.1 — 2026-08-01
 
 ### What's New note for the review loop
