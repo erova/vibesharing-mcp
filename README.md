@@ -2,6 +2,12 @@
 
 **The missing link between your AI coding assistant and your team.**
 
+> **Note for anyone reading this on GitHub:** [erova/vibesharing-mcp](https://github.com/erova/vibesharing-mcp)
+> is a read-only mirror, published automatically on each release. Pull requests against it will be
+> overwritten by the next sync. To report a bug or request a change, please
+> [open an issue](https://github.com/erova/vibesharing-mcp/issues) or write to
+> [hello@vibesharing.app](mailto:hello@vibesharing.app).
+
 Build prototypes with Claude Code, Cursor, or any AI tool — then instantly share them with your team for feedback. No context switching. No copy-pasting URLs. Just ship and collaborate.
 
 ## Quick Start
