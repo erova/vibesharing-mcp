@@ -80,7 +80,7 @@ Claude confirms the collection, names the deployment, and handles everything —
 "What feedback did I get on the checkout flow?"
 "Walk me through Jordan's comments"
 ```
-Open feedback is surfaced automatically at the start of each session. Asked without a name, `get_feedback` groups everything by author — "9 items from 4 people, 6 open" — instead of returning a wall of text. Asked with a name, it walks that person's comments one at a time, each with the page it was left on, the pinned position, the screenshot, the question it answered, and the replies underneath. You decide per comment whether to build it, skip it, or discuss — and `close_feedback_loop` tells the person what you did.
+Asked without a name, `get_feedback` groups everything by author — "9 items from 4 people, 6 open" — instead of returning a wall of text. Asked with a name, it walks that person's comments one at a time, each carrying the page it was left on, the pinned position, a link to the screenshot captured when the comment was written, the question it answered, and the replies underneath. You decide per comment whether to build it, skip it, or discuss — and `close_feedback_loop` tells the person what you did.
 
 ### Keep every version, and branch safely
 ```
