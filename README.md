@@ -65,15 +65,42 @@ One command. No Vercel, no GitHub, no React wrapper. Your HTML page goes live wi
 
 ### Deploy full projects
 ```
-"Deploy this to VibeSharing in the Hero Use Cases collection as erg-v3-teams"
+"Deploy this to VibeSharing in the Hero Use Cases collection as checkout-v3"
 ```
-Claude confirms the collection, names the deployment, and handles everything — GitHub repo, Vercel deploy, team registration — in one conversation.
+Claude confirms the collection, names the deployment, and handles everything — GitHub repo, deploy, team registration — in one conversation. Your first three prototypes are hosted on us; connect your own Vercel or Netlify account and the limit disappears.
 
-### Check feedback before you start working
+### Match your design system from the first prompt
+```
+"Build a settings page using our design system"
+```
+`quick_prototype` picks the right template from your org, hands the AI its CSS variables and written design instructions, and deploys — so the prototype is on-brand as it's generated, instead of built generic and retrofitted. Browse what's available with `list_templates`.
+
+### Go through feedback one person at a time
 ```
 "What feedback did I get on the checkout flow?"
+"Walk me through Jordan's comments"
 ```
-Open feedback is surfaced automatically at the start of each session. You can also triage, respond, and close feedback directly from your editor.
+Open feedback is surfaced automatically at the start of each session. Asked without a name, `get_feedback` groups everything by author — "9 items from 4 people, 6 open" — instead of returning a wall of text. Asked with a name, it walks that person's comments one at a time, each with the page it was left on, the pinned position, the screenshot, the question it answered, and the replies underneath. You decide per comment whether to build it, skip it, or discuss — and `close_feedback_loop` tells the person what you did.
+
+### Keep every version, and branch safely
+```
+"Show me the version history"
+"Fork this so I can try a dark variant"
+"Roll back to v3"
+```
+Every deploy is a numbered version with its own immutable URL. `fork_prototype` copies one to a separate URL so you can explore without touching the original, and `rollback_deploy` restores any earlier version — for git-based and static prototypes alike.
+
+### Put it in front of customers
+```
+"Set up a study comparing these three variants"
+```
+`create_campaign` bundles several prototypes behind one gated portal with your own questions — star ratings, multiple choice, free text — and supports blind randomized A/B/C ordering so a name like "v2" can't skew a preference test. It lands as a draft; opening it and inviting the cohort stays a deliberate step in the dashboard.
+
+### Catch build failures before deploying
+```
+"Check this will build before we ship it"
+```
+`validate_project` looks for the things that actually break deploys — a missing framework dependency, no build script, conflicting configs — and returns fixes rather than a stack trace after the fact.
 
 ### Keep context alive across sessions
 ```
@@ -87,23 +114,36 @@ Your project context persists on VibeSharing, so any team member (or AI session)
 ```
 The `diagnose` tool checks your token, GitHub connection, deploy locks, and recent errors — and auto-fixes what it can. If it can't fix something, `send_support_request` sends a detailed report to the admin.
 
-## Available Tools (21)
+## Available Tools (31)
 
 | Tool | Description |
 |------|-------------|
 | **Deploy & Share** | |
-| `share_html` | Share static HTML instantly — no Vercel, no GitHub. Auto-bundles CSS/SVGs/images. |
-| `deploy_files` | Deploy multi-file projects to GitHub + Vercel with named deployments |
+| `quick_prototype` | Idea to live URL in one step — picks a design system template, generates on-brand code, deploys |
+| `share_html` | Share static HTML instantly — no hosting account, no GitHub. Auto-bundles CSS/SVGs/images. |
+| `deploy_files` | Deploy multi-file projects to GitHub + your hosting provider with named deployments |
 | `deploy_prototype` | Deploy a single code file directly |
 | `import_repo` | Import a GitHub repo into VibeSharing |
 | `register_prototype` | Register an already-deployed prototype by URL |
+| `validate_project` | Check a project will build before deploying — missing frameworks, build scripts, conflicting configs |
+| **Design systems** | |
+| `list_templates` | List your org's design system templates |
+| `get_template` | Get a template's CSS variables, starter page, and AI design instructions — call before writing code |
 | **Organize** | |
 | `resolve_target` | Fuzzy-match collections and projects — confirms where to deploy |
 | `create_collection` | Create a new collection |
 | `list_prototypes` | List/search all prototypes in your org |
 | `list_collections` | List/search all collections |
+| `update_prototype` | Rename a prototype or update its description and URL, in place |
+| `delete_prototype` | Delete a prototype and its history — irreversible, creator or org admin only |
+| **Versions & variants** | |
+| `list_versions` | Version history — version numbers, file counts, commit info, what can be rolled back |
+| `fork_prototype` | Copy a prototype to its own URL to explore a variant; the original is untouched |
+| `rollback_deploy` | Restore a previous version, for git-based and static prototypes |
+| **Research** | |
+| `create_campaign` | Set up a customer study — several prototypes, your questions, optional blind A/B/C ordering |
 | **Feedback** | |
-| `get_feedback` | Get feedback and comments for a prototype |
+| `get_feedback` | Feedback grouped by author, or one person's comments as a queue with full context |
 | `triage_feedback` | Update status, priority, or assignee on feedback |
 | `generate_feedback_topics` | Create guided feedback questions for reviewers |
 | `close_feedback_loop` | Resolve feedback with a note back to the stakeholder |
