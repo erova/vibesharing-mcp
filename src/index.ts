@@ -14,6 +14,40 @@ import { homedir } from "os";
 
 const PKG = JSON.parse(readFileSync(join(__dirname, "..", "package.json"), "utf-8"));
 
+// Fixed set of structured-critique prompts — used when focus="critique" instead of
+// requiring the caller to supply topics. Aimed at a fast, opinionated design review
+// rather than open-ended stakeholder feedback.
+const CRITIQUE_TOPICS: Array<{ title: string; description: string; theme: string }> = [
+  {
+    title: "How directionally correct does this feel?",
+    description: "Not pixel-perfect — is this pointed the right way?",
+    theme: "critique",
+  },
+  {
+    title: "Do you agree with the thinking behind this?",
+    description: "React to the reasoning, not just the execution.",
+    theme: "critique",
+  },
+  {
+    title: "Where would you push this further?",
+    description: "What's the next move if we had more time?",
+    theme: "critique",
+  },
+  {
+    title: "What's the first thing that feels unresolved?",
+    description: "Call out anything that still feels rough or undecided.",
+    theme: "critique",
+  },
+];
+
+// Same structured-critique prompts as CRITIQUE_TOPICS, in the campaign question
+// shape (comment-only, no rating/choice) — used when create_campaign is called
+// with preset="critique" instead of an explicit `questions` array.
+const CRITIQUE_STUDY_QUESTIONS: Array<{ prompt: string; comment: boolean }> = CRITIQUE_TOPICS.map((t) => ({
+  prompt: t.title,
+  comment: true,
+}));
+
 // VibeSharing API client
 class VibesharingClient {
   private baseUrl: string;
@@ -1420,12 +1454,17 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "create_campaign",
         description:
-          "Create a research campaign (customer/user study) in VibeSharing. A campaign bundles several prototypes behind one gated portal and asks reviewers structured questions. Great for A/B/C preference tests across variants. Creates the campaign as a DRAFT — review and open/send it from the dashboard (opening applies access gating and invites the cohort). Each question can collect a 1–5 star rating, a multiple choice, and/or a free comment. Ask the user which prototypes and what to ask before calling.",
+          "Create a research campaign (customer/user study) in VibeSharing. A campaign bundles several prototypes behind one gated portal and asks reviewers structured questions. Great for A/B/C preference tests across variants. Creates the campaign as a DRAFT — review and open/send it from the dashboard (opening applies access gating and invites the cohort). Each question can collect a 1–5 star rating, a multiple choice, and/or a free comment. Ask the user which prototypes and what to ask before calling — or pass preset: 'critique' to skip that and use a fixed structured-critique question set instead.",
         inputSchema: {
           type: "object",
           properties: {
             name: { type: "string", description: "Campaign name (e.g., 'Risk Maestro — visual direction test')" },
             goal: { type: "string", description: "The research goal / participant brief shown at the start of the portal." },
+            preset: {
+              type: "string",
+              enum: ["critique"],
+              description: "Optional. 'critique' applies a fixed structured-critique question set (directional fit, reasoning, push-further, what's unresolved) as the campaign-level questions when `questions` is omitted. Same prompts as generate_feedback_topics' focus='critique'. Best for early/rough work reviewed by peers rather than a formal preference test — pairs naturally with feedback_mode='guided' (the default) and a single prototype.",
+            },
             feedback_mode: {
               type: "string",
               enum: ["guided", "open"],
@@ -1447,7 +1486,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             expires_in_days: { type: "number", description: "Optional: auto-expire the campaign after N days once opened." },
             questions: {
               type: "array",
-              description: "Optional campaign-level questions asked once after all prototypes (e.g., an overall preference question).",
+              description: "Optional campaign-level questions asked once after all prototypes (e.g., an overall preference question). Not required when preset is 'critique'.",
               items: {
                 type: "object",
                 properties: {
@@ -1767,7 +1806,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "generate_feedback_topics",
         description:
-          "Auto-generate feedback questions for a prototype based on what was built. IMPORTANT: Before generating questions, ask the user: 'What type of feedback is most important for this deploy?' and present these options:\n\n  1. Awareness only — just sharing progress, no feedback needed\n  2. Design direction — brand, visual, layout feedback\n  3. Technical feasibility — is this buildable, are these features doable\n  4. Vision alignment — does this match where we're going\n  5. Interaction design — usability, flow, UX patterns\n  6. Full review — all feedback welcome (default)\n\nUse their answer as the 'focus' parameter. If 'awareness', skip topic generation and just set the brief. Otherwise generate 3-5 questions, weighting toward the chosen focus theme.",
+          "Auto-generate feedback questions for a prototype based on what was built. IMPORTANT: Before generating questions, ask the user: 'What type of feedback is most important for this deploy?' and present these options:\n\n  1. Awareness only — just sharing progress, no feedback needed\n  2. Design direction — brand, visual, layout feedback\n  3. Technical feasibility — is this buildable, are these features doable\n  4. Vision alignment — does this match where we're going\n  5. Interaction design — usability, flow, UX patterns\n  6. Structured critique — fixed design-crit prompts (directional fit, reasoning, push-further), good for early/rough work reviewed by peers\n  7. Full review — all feedback welcome (default)\n\nUse their answer as the 'focus' parameter. If 'awareness', skip topic generation and just set the brief. If 'critique', omit `topics` — a fixed structured-critique set is applied automatically. Otherwise generate 3-5 questions, weighting toward the chosen focus theme.",
         inputSchema: {
           type: "object",
           properties: {
@@ -1777,8 +1816,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             focus: {
               type: "string",
-              enum: ["awareness", "design", "feasibility", "vision", "interaction", "full"],
-              description: "The type of feedback the designer wants. 'awareness' = no questions, just FYI. Others emphasize that theme. 'full' = all themes equally. Default: 'full'.",
+              enum: ["awareness", "design", "feasibility", "vision", "interaction", "critique", "full"],
+              description: "The type of feedback the designer wants. 'awareness' = no questions, just FYI. 'critique' = fixed structured-critique prompts, no `topics` needed. Others emphasize that theme. 'full' = all themes equally. Default: 'full'.",
             },
             brief: {
               type: "string",
@@ -1799,13 +1838,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                   },
                   theme: {
                     type: "string",
-                    enum: ["vision", "feasibility", "design", "interaction"],
-                    description: "Question theme: 'vision' (alignment with goals), 'feasibility' (technical possibility), 'design' (brand/visual fidelity), 'interaction' (usability/UX patterns)",
+                    enum: ["vision", "feasibility", "design", "interaction", "critique"],
+                    description: "Question theme: 'vision' (alignment with goals), 'feasibility' (technical possibility), 'design' (brand/visual fidelity), 'interaction' (usability/UX patterns), 'critique' (structured design crit)",
                   },
                 },
                 required: ["title"],
               },
-              description: "Array of feedback questions to create. Generate 3-5 based on what you built. Weight toward the focus theme (e.g., if focus is 'feasibility', 2-3 questions should be feasibility-themed). Not required when focus is 'awareness'.",
+              description: "Array of feedback questions to create. Generate 3-5 based on what you built. Weight toward the focus theme (e.g., if focus is 'feasibility', 2-3 questions should be feasibility-themed). Not required when focus is 'awareness' or 'critique'.",
             },
             scope_note: {
               type: "string",
@@ -2796,9 +2835,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "create_campaign": {
-        const campaignArgs = args as {
+        const { preset, ...campaignArgs } = args as {
           name: string;
           goal?: string;
+          preset?: string;
           feedback_mode?: "guided" | "open";
           feedback_layout?: "new_window" | "side_rail";
           variant_group?: string;
@@ -2808,6 +2848,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           prototypes?: Array<{ prototype_id: string; about?: string; questions?: unknown[] }>;
         };
 
+        if (preset === "critique" && (!campaignArgs.questions || campaignArgs.questions.length === 0)) {
+          campaignArgs.questions = CRITIQUE_STUDY_QUESTIONS;
+        }
+
         const result = await client.createCampaign(campaignArgs);
         const c = result.campaign;
         const attached: string[] = result.attached || [];
@@ -2816,6 +2860,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         let text = `Draft research campaign created!\n\nName: ${c.name}\nStatus: ${c.status} (not yet open)\n`;
         if (attached.length) text += `Prototypes: ${attached.join(", ")}\n`;
         if (skipped.length) text += `⚠ Skipped (not found in your org): ${skipped.join(", ")}\n`;
+        if (preset === "critique") text += `Questions: structured critique preset (${CRITIQUE_STUDY_QUESTIONS.length} prompts)\n`;
         text += `\nReview & open it (opening applies access gating + invites your reviewers):\n${result.dashboardUrl}\n\nPortal link (after you open it): ${result.portalUrl}`;
 
         return { content: [{ type: "text", text }] };
@@ -3673,6 +3718,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           feasibility: "Feasibility",
           design: "Design Fidelity",
           interaction: "Interaction Design",
+          critique: "Structured Critique",
         };
 
         const focusLabels: Record<string, string> = {
@@ -3681,6 +3727,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           feasibility: "Technical feasibility",
           vision: "Vision alignment",
           interaction: "Interaction design",
+          critique: "Structured critique",
           full: "Full review",
         };
 
@@ -3718,19 +3765,23 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
 
         // All other modes: generate questions
-        if (!topics || topics.length === 0) {
+        let workingTopics = topics;
+        if ((!workingTopics || workingTopics.length === 0) && feedbackFocus === "critique") {
+          workingTopics = CRITIQUE_TOPICS;
+        }
+        if (!workingTopics || workingTopics.length === 0) {
           return {
-            content: [{ type: "text", text: "Error: At least one topic is required when focus is not 'awareness'." }],
+            content: [{ type: "text", text: "Error: At least one topic is required when focus is not 'awareness' or 'critique'." }],
           };
         }
 
         // Sort topics: focused theme first, then others
         const sortedTopics = feedbackFocus !== "full"
           ? [
-              ...topics.filter(t => t.theme === feedbackFocus),
-              ...topics.filter(t => t.theme !== feedbackFocus),
+              ...workingTopics.filter(t => t.theme === feedbackFocus),
+              ...workingTopics.filter(t => t.theme !== feedbackFocus),
             ]
-          : topics;
+          : workingTopics;
 
         const result = await client.generateFeedbackTopics(project_id, sortedTopics);
         const created = result.topics || [];

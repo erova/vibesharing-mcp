@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.16.0 — 2026-08-10
+
+### A fixed critique prompt set, for when there's no one around to ask
+
+`generate_feedback_topics` and `create_campaign` both write their own questions — from a deploy summary, from a brief. That's the right default when you know who you're asking and what you want from them. It's the wrong default for a design crit: early, rough work that just needs a peer's reaction, not a bespoke question set inferred from what got built.
+
+**What changed:**
+- **`generate_feedback_topics`** accepts `focus: "critique"` — applies four fixed structured-critique prompts (how directionally correct does this feel, do you agree with the thinking, where would you push this further, what's the first thing that feels unresolved) as feedback topics with no AI generation call. Topics get a new `critique` theme, with its own badge color in the feedback panel.
+- **`create_campaign`** accepts `preset: "critique"` — seeds a research study's campaign-level questions with the same four prompts when `questions` is omitted, so the wording matches whether the ask is an async deploy comment thread or a full study.
+- Both are opt-in. Omit `focus`/`preset` and nothing about existing behavior changes.
+
 ## 0.15.0 — 2026-08-03
 
 ### Feedback screenshots you can actually see

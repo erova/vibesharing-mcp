@@ -1,6 +1,6 @@
 {
   "name": "@vibesharingapp/mcp-server",
-  "version": "0.15.0",
+  "version": "0.16.0",
   "description": "MCP server for VibeSharing - register prototypes and get feedback directly from Claude Code",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
