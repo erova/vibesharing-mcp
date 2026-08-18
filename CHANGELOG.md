@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.16.1 — 2026-08-18
+
+### `import_repo` stopped writing GitHub as the "live" URL
+
+When `import_repo` registered a new prototype, it wrote the GitHub source URL into the field the viewer treats as the live deploy — meant to be overwritten once hosting actually succeeded. If the deploy step failed before that correction ran, the record was left pointing at `github.com` permanently: the viewer hung on "Loading the prototype..." forever, since GitHub blocks being framed.
+
+**What changed:**
+- The placeholder write is gone. A newly imported prototype's URL now stays empty until a real deploy succeeds, so a failed import surfaces as "not found" instead of a silently broken, permanently stuck viewer.
+
 ## 0.16.0 — 2026-08-10
 
 ### A fixed critique prompt set, for when there's no one around to ask

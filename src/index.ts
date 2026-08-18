@@ -3132,7 +3132,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           const registered = await client.registerPrototype({
             name: protoName,
             description: importDesc || `Imported from ${repo_url}`,
-            external_url: repo_url,
+            // external_url is intentionally omitted here — it must hold the live
+            // deploy URL, not the GitHub source. import-repo's deploy step sets it
+            // once a real deployment succeeds (app/api/git/import-repo/route.ts).
             collection_id: importCollectionId,
             parent_project_id: importParentId,
           });
