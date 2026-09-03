@@ -7,6 +7,8 @@ import {
   ListToolsRequestSchema,
   ListResourcesRequestSchema,
   ReadResourceRequestSchema,
+  ListPromptsRequestSchema,
+  GetPromptRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { readFileSync, writeFileSync, mkdirSync } from "fs";
 import { join, basename } from "path";
@@ -1087,6 +1089,7 @@ const server = new Server(
     capabilities: {
       tools: {},
       resources: {},
+      prompts: {},
     },
     instructions: `VibeSharing MCP Server v${CURRENT_VERSION} — helps users share prototypes with their team and collect feedback.\n\nWhen the user says "share this", "publish this", "push this to VibeSharing", or anything suggesting they want others to see their work — deploy it. If their org has design system templates and they're starting something new, ask which template they'd like to use so the prototype matches their brand from the start.`,
   }
@@ -4385,6 +4388,83 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
       },
     ],
   };
+});
+
+// List available prompts (discoverable, pre-filled entry points into common tool sequences)
+server.setRequestHandler(ListPromptsRequestSchema, async () => {
+  return {
+    prompts: [
+      {
+        name: "quick-prototype",
+        description: "Go from an idea to a live, on-brand prototype in one step using quick_prototype.",
+        arguments: [
+          {
+            name: "description",
+            description: "What the prototype should show or do",
+            required: true,
+          },
+        ],
+      },
+      {
+        name: "triage-inbox",
+        description: "Review a project's open feedback item by item and triage each one (status/priority/assignee) via get_feedback + triage_feedback.",
+        arguments: [
+          {
+            name: "project_id",
+            description: "The VibeSharing project/prototype ID",
+            required: true,
+          },
+          {
+            name: "author",
+            description: "Review only this person's feedback, one item at a time (first name, full name, or email)",
+            required: false,
+          },
+        ],
+      },
+    ],
+  };
+});
+
+// Get a specific prompt (expands to a ready-to-run instruction referencing existing tools)
+server.setRequestHandler(GetPromptRequestSchema, async (request) => {
+  const { name, arguments: args } = request.params;
+
+  if (name === "quick-prototype") {
+    const description = args?.description;
+    if (!description) throw new Error("Missing required argument: description");
+    return {
+      messages: [
+        {
+          role: "user",
+          content: {
+            type: "text",
+            text: `Use the quick_prototype tool to create and deploy a prototype for: "${description}". If quick_prototype does not resolve a template on its own, call list_templates first and pick the closest match before deploying.`,
+          },
+        },
+      ],
+    };
+  }
+
+  if (name === "triage-inbox") {
+    const projectId = args?.project_id;
+    if (!projectId) throw new Error("Missing required argument: project_id");
+    const author = args?.author;
+    return {
+      messages: [
+        {
+          role: "user",
+          content: {
+            type: "text",
+            text: author
+              ? `Use get_feedback with project_id="${projectId}" and author="${author}" to pull that person's feedback as an ordered queue, then review each item one at a time — for each, decide build/skip/discuss and call triage_feedback to record the status, priority, and a resolution_note.`
+              : `Use get_feedback with project_id="${projectId}" to see who left feedback and what they said, then for each open item call triage_feedback to set status/priority/assignee. Ask me who to review first if it's not obvious.`,
+          },
+        },
+      ],
+    };
+  }
+
+  throw new Error(`Unknown prompt: ${name}`);
 });
 
 // Start the server
