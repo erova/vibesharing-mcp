@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.17.0 — 2026-09-03
+
+### Prompts: discoverable entry points, not just tools
+
+Every capability so far has been a tool the assistant has to already know to reach for. `.claude/skills/` gives repo maintainers the same thing as a `/command` — a named, pre-filled entry point — but MCP clients had no equivalent.
+
+**What changed:**
+- Two MCP Prompts, listed and invocable by any client that supports them (Claude Code, Cursor): `quick-prototype` (idea → deploy in one step, wraps `quick_prototype`) and `triage-inbox` (walks `get_feedback` → `triage_feedback` for a project, optionally scoped to one author).
+- Purely additive — no existing tool behavior changed.
+
 ## 0.16.1 — 2026-08-18
 
 ### `import_repo` stopped writing GitHub as the "live" URL
