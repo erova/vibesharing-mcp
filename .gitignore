@@ -9,3 +9,6 @@ dist
 # mirror repo by the sync workflow. Both had expired by then, but never again.
 .mcpregistry_github_token
 .mcpregistry_registry_token
+
+# npm auth token — credentials, never track.
+.npmrc
