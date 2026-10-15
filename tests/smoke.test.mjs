@@ -83,3 +83,18 @@ test("diagnose reports server health", async () => {
   // returned a real report, not just an empty string.
   assert.ok(text.length > 50, "diagnose should produce a substantive report");
 });
+
+test("write-context prompt is listed and expands to the context-writing instructions", async () => {
+  const { prompts } = await client.listPrompts();
+  assert.ok(prompts.some((p) => p.name === "write-context"), "write-context prompt missing");
+  const res = await client.getPrompt({ name: "write-context", arguments: { project_id: env.prototypeId } });
+  const text = res.messages[0].content.text;
+  assert.match(text, /Decisions and why/);
+  assert.ok(text.includes(env.prototypeId));
+});
+
+test("get_prototype_context returns the prototype's context for an id and a share-style ref", async () => {
+  const res = await client.callTool({ name: "get_prototype_context", arguments: { prototype: env.prototypeId } });
+  assert.ok(!res.isError, textOf(res));
+  assert.match(textOf(res), /^# /m);
+});

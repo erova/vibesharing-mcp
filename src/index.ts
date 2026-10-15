@@ -13,6 +13,7 @@ import {
 import { readFileSync, writeFileSync, mkdirSync } from "fs";
 import { join, basename } from "path";
 import { homedir } from "os";
+import { buildWriteContextPrompt } from "./context-prompt.js";
 
 const PKG = JSON.parse(readFileSync(join(__dirname, "..", "package.json"), "utf-8"));
 
@@ -190,10 +191,15 @@ class VibesharingClient {
       body: JSON.stringify({
         projectId,
         content,
-        version: "auto-sync",
+        version: "context",
         updatedByName: "MCP Deploy",
+        silent: true, // context only: don't bump current_version or notify followers
       }),
     });
+  }
+
+  async getPrototypeContext(ref: string): Promise<{ markdown: string; has_baseline: boolean }> {
+    return this.request(`/api/prototypes/${encodeURIComponent(ref)}/context?format=markdown`);
   }
 
   async listFeedbackTopics(projectId: string) {
@@ -1277,7 +1283,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "sync_context",
         description:
-          "Sync your CLAUDE.md, AGENTS.md, or project context to VibeSharing. This helps maintain context across AI sessions and team members.",
+          "Save a prototype's context to VibeSharing: what it is, who it is for, what is in it, and the decisions behind it. Best written from the conversation that produced the prototype — use the `write-context` prompt for the format, show the author the draft, then sync it. Other people and AI (e.g. Claude desktop via get_prototype_context) read this to understand the prototype.",
         inputSchema: {
           type: "object",
           properties: {
@@ -1771,6 +1777,21 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
           },
           required: ["title"],
+        },
+      },
+      {
+        name: "get_prototype_context",
+        description:
+          "Read what a prototype is and what it's doing: description, project context (CLAUDE.md), deploy history with decisions and known issues, the feedback brief and questions, reference links, and recent feedback. Use this whenever the user shares a prototype link (vibesharing.app/s/...), names a prototype, or asks what a prototype is for. Fetching the share link directly only returns an empty page shell — this tool returns the real context.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            prototype: {
+              type: "string",
+              description: "A VibeSharing share URL (https://vibesharing.app/s/...), a share slug, or a prototype ID.",
+            },
+          },
+          required: ["prototype"],
         },
       },
       {
@@ -2992,6 +3013,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         const postDeployNotes: string[] = [];
         if (contextSynced) postDeployNotes.push("Context synced from CLAUDE.md.");
+        else {
+          try {
+            const existing = await client.getPrototypeContext(deployProtoId);
+            if (!existing.has_baseline) {
+              postDeployNotes.push(
+                'This prototype has no "what this is" context yet, so anyone opening it (or an AI reading it for them) sees only the deploy history. Draft one from this conversation using the `write-context` prompt, show it to the author, then save it with sync_context.'
+              );
+            }
+          } catch {
+            // best-effort nudge; never block a deploy response
+          }
+        }
 
         // Surface build status clearly
         const dfBuildFailed = deployResult.buildError || deployResult.success === false;
@@ -3638,6 +3671,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             },
           ],
         };
+      }
+
+      case "get_prototype_context": {
+        const { prototype } = args as { prototype: string };
+        if (!prototype?.trim()) {
+          return { content: [{ type: "text", text: "Error: prototype is required (share URL, slug, or ID)." }], isError: true };
+        }
+        const value = prototype.trim();
+        const slugMatch = value.match(/\/s\/([^/?#\s]+)/);
+        const idMatch = value.match(/\/dashboard\/projects\/([0-9a-f-]{36})/i);
+        const ref = slugMatch ? decodeURIComponent(slugMatch[1]) : idMatch ? idMatch[1] : value;
+        const result = await client.getPrototypeContext(ref);
+        return { content: [{ type: "text", text: result.markdown }] };
       }
 
       case "list_context_links": {
@@ -4395,6 +4441,18 @@ server.setRequestHandler(ListPromptsRequestSchema, async () => {
   return {
     prompts: [
       {
+        name: "write-context",
+        description:
+          'Write the "what this is" context file for a prototype from this conversation (what it is, who it is for, decisions and why), review it with the author, then save it with sync_context.',
+        arguments: [
+          {
+            name: "project_id",
+            description: "The VibeSharing project/prototype ID (optional — the assistant can look it up)",
+            required: false,
+          },
+        ],
+      },
+      {
         name: "quick-prototype",
         description: "Go from an idea to a live, on-brand prototype in one step using quick_prototype.",
         arguments: [
@@ -4428,6 +4486,17 @@ server.setRequestHandler(ListPromptsRequestSchema, async () => {
 // Get a specific prompt (expands to a ready-to-run instruction referencing existing tools)
 server.setRequestHandler(GetPromptRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
+
+  if (name === "write-context") {
+    return {
+      messages: [
+        {
+          role: "user",
+          content: { type: "text", text: buildWriteContextPrompt(args?.project_id) },
+        },
+      ],
+    };
+  }
 
   if (name === "quick-prototype") {
     const description = args?.description;

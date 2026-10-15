@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.18.0 — 2026-10-15
+
+### Context you can read, and a prompt to write it
+
+A prototype's context is what lets a teammate — or an AI acting for them, like Claude desktop — understand it without having been in the room. Until now it could be written but not read back, and it was rarely written at all.
+
+**What changed:**
+- **`get_prototype_context`**: reads a prototype's description, project context, deploy history, feedback brief, reference links and recent feedback. Accepts a share link, slug or ID, so pasting a `/s/...` link into an AI chat now returns real context instead of an empty page shell.
+- **`write-context` prompt**: drafts the "what this is" context from the conversation that produced the prototype — what it is, who it is for, what's in it, decisions and why, assumptions and open questions — and has the author approve it before `sync_context` saves it.
+- **Deploy nudge**: `deploy_files` points to `write-context` when a prototype has no context yet.
+- **`sync_context`** is now a quiet save: it no longer overwrites the prototype's version label or notifies followers.
+
 ## 0.17.0 — 2026-09-03
 
 ### Prompts: discoverable entry points, not just tools
